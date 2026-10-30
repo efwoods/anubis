@@ -6,6 +6,13 @@ cap does not depend on LangSmith's usage reporting, which lags real traffic.
 
 How the trace tally works:
 
+- Only conversation messages are traced. ``/message`` and ``/message/resume``
+  (``message_graph_sse``) pin the root run id of the message's graph run and
+  register that run id with ``allow_message_trace``. Every other trace, such as
+  model and tool calls made by the inbox poller, the mailbox IDLE watchers,
+  scheduled reports, the sweepers, or the phone worker, is dropped before the
+  trace leaves the process and takes no slot, so the monthly limit is spent
+  only on traces used to debug messages.
 - Every run the langsmith client sends (a new run or an update to a run) passes
   through ``Client._filter_for_sampling``, keyed by the run's trace id. The
   trace tally wraps that filter. The first time a trace id is seen, the trace
@@ -55,6 +62,13 @@ LANGSMITH_GRANULAR_USAGE_PATH = "/api/v1/orgs/current/billing/granular-usage"
 # decision. An evicted trace id that reappears takes a second slot, which can
 # only over-count.
 REMEMBERED_TRACE_IDS = 200_000
+# Root run ids of conversation messages, registered by ``allow_message_trace``.
+# A trace id missing from message_trace_ids is not a message trace and is
+# dropped by the installed filter. The oldest message trace ids are evicted
+# past REMEMBERED_TRACE_IDS; a message turn runs for minutes, not for 200,000
+# later message turns.
+message_trace_ids: OrderedDict[str, None] = OrderedDict()
+message_trace_ids_lock = threading.Lock()
 # Seconds to wait after LangSmith's end of billing period before reading the
 # next period, and between retries when LangSmith cannot be read.
 PERIOD_BOUNDARY_GRACE_SECONDS = 60.0
@@ -359,8 +373,28 @@ def trace_id_of(run: Any) -> str | None:
     return str(run_id) if run_id is not None else None
 
 
+def allow_message_trace(trace_id: str) -> None:
+    """Register the root run id of a conversation message's graph run as a traced trace id."""
+    with message_trace_ids_lock:
+        message_trace_ids[str(trace_id)] = None
+        message_trace_ids.move_to_end(str(trace_id))
+        if len(message_trace_ids) > REMEMBERED_TRACE_IDS:
+            message_trace_ids.popitem(last=False)
+
+
+def is_message_trace(trace_id: str | None) -> bool:
+    """Return True when the trace id was registered by ``allow_message_trace``."""
+    if trace_id is None:
+        return False
+    with message_trace_ids_lock:
+        return trace_id in message_trace_ids
+
+
 def install_trace_tally_filter(trace_tally: TraceTally) -> bool:
     """Wrap ``langsmith.Client._filter_for_sampling`` so every run passes the trace tally.
+
+    A run whose trace is not a conversation message trace (``is_message_trace``)
+    is dropped without taking a slot.
 
     Returns False when the langsmith release has no such method; the caller
     then turns tracing off, because the trace tally cannot see traces.
@@ -377,8 +411,8 @@ def install_trace_tally_filter(trace_tally: TraceTally) -> bool:
         return [
             run
             for run in sampled_runs
-            if (trace_id := trace_id_of(run)) is None
-            or trace_tally.admit_trace(trace_id)
+            if is_message_trace(trace_id := trace_id_of(run))
+            and trace_tally.admit_trace(trace_id)
         ]
 
     filter_through_trace_tally._original_filter = original_filter  # type: ignore[attr-defined]

@@ -58,6 +58,21 @@ class UserPreferenceAndContext(BaseModel):
             "lists, paragraphs, or emoji; other for anything else. When unsure, other."
         ),
     )
+    preferred_name: str | None = Field(
+        default=None,
+        description=(
+            "The one name the user wants to be called, exactly as the user gave the "
+            "name (for example 'Sam'). Set only for an address preference."
+        ),
+    )
+    rejected_names: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Every name the user said NOT to call the user (for example ['David'] "
+            "for 'do not call me David'). Each rejected name is removed from memory. "
+            "Never write a rejected name inside the preference sentence."
+        ),
+    )
 
 
 class WhatFeelsRealAndContext(BaseModel):
@@ -116,6 +131,8 @@ async def learn_user_preference(
     preference: str,
     preference_context: str,
     category: str = "other",
+    preferred_name: str | None = None,
+    rejected_names: list[str] | None = None,
     runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
 ) -> Command:
     """<INSTRUCTIONS>
@@ -130,7 +147,10 @@ async def learn_user_preference(
       1. preference: "The user prefers to be called Sam." category: address
       2. preference: "The user wants short replies." category: communication_style
       3. preference: "The user does not want pep talks or motivational framing." category: communication_style
-    User: "Learn to be surprised when I make a gross face and say You're so gross! Stop that! Yuck!"
+    User: "My name is Sam, do not call me Alex."
+    One call:
+      1. preference: "Address the user as Sam." category: address preferred_name: "Sam" rejected_names: ["Alex"]
+        User: "Learn to be surprised when I make a gross face and say You're so gross! Stop that! Yuck!"
     One call:
       1. preference: "When the user makes a gross face or a gag on camera, be surprised or disgusted and say You're so gross! Stop that! Yuck!" category: communication_style
     </EXAMPLE>
@@ -144,14 +164,104 @@ async def learn_user_preference(
       only by the owner and never by anybody else who talks to the avatar, and this tool
       refuses the correction.
     NEVER call this tool twice with the same preference.
+    A preference is never permanent. When the user changes a preference, call this tool again
+      with the new preference; for an address preference set preferred_name, and the new name
+      replaces the earlier name. The user may change the name any number of times, including
+      back to a name the user used before.
+    NEVER write a name the user rejected inside the preference sentence. "The user wants to be
+      called Sam and never Alex" keeps the rejected name in memory. Write only the wanted name
+      in the preference, and pass each rejected name in rejected_names.
     </RESTRICTIONS>
     """
+    from src.anubis.utils.learning.address_correction import (
+        extract_preferred_address_name,
+        extract_rejected_address_names,
+        extract_stated_user_name,
+        purge_rejected_address_name,
+        relearn_user_address_name,
+        text_mentions_name,
+    )
     from src.anubis.utils.tools.identity.identity_tools import (
         _caller_is_avatar_owner,
         _latest_user_message_text,
         avatar_fact_correction_redirect,
         message_corrects_a_fact_about_the_avatar,
     )
+
+    latest_user_message_text = _latest_user_message_text(
+        (runtime.state or {}).get("messages")
+    )
+    # The rejected names come from the tool arguments and from the user's own
+    # latest message, so a rejection is honored even when the model leaves the
+    # rejected_names argument empty.
+    all_rejected_names: list[str] = []
+    for rejected_name in [
+        *(rejected_names or []),
+        *extract_rejected_address_names(latest_user_message_text),
+    ]:
+        rejected_name = (rejected_name or "").strip()
+        if rejected_name and rejected_name.lower() not in {
+            existing.lower() for existing in all_rejected_names
+        }:
+            all_rejected_names.append(rejected_name)
+
+    wanted_name = (preferred_name or "").strip() or extract_preferred_address_name(
+        latest_user_message_text
+    )
+    if all_rejected_names or (category == "address" and wanted_name):
+        # How the user is named is never a fact about the avatar, so the owner
+        # redirect below does not apply to a name.
+        updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(
+            runtime.config
+        )
+        name_user_id = updated_user_state.get("user_id")
+        name_assistant_id = updated_assistant_state.get("assistant_id")
+        for rejected_name in all_rejected_names:
+            await purge_rejected_address_name(
+                runtime.store,
+                name_user_id,
+                name_assistant_id,
+                rejected_name=rejected_name,
+                correct_name=wanted_name,
+            )
+        if wanted_name:
+            # The name the user wants REPLACES the earlier names. The user may
+            # change the name any number of times; the newest name is the one
+            # stored. "Call me Sam" can be a nickname, so the stored "My name is
+            # ..." fact is replaced only when the user said "my name is".
+            stated_user_name = extract_stated_user_name(latest_user_message_text)
+            await relearn_user_address_name(
+                runtime.store,
+                name_user_id,
+                name_assistant_id,
+                new_name=wanted_name,
+                replaces_name_fact=bool(
+                    stated_user_name and stated_user_name.lower() == wanted_name.lower()
+                ),
+            )
+        # A different preference dictated in the same message ("and keep replies
+        # short") is not about the name and is stored by the ordinary path below.
+        if category == "address" or any(
+            text_mentions_name(preference, rejected_name)
+            for rejected_name in all_rejected_names
+        ):
+            from src.anubis.utils.learning.fact_learned import announce_fact_learned
+
+            learned_summary = (
+                f"Address the user as {wanted_name}."
+                if wanted_name
+                else "The user rejected a name."
+            )
+            announce_fact_learned(learned_summary, kind="preference")
+            removal_note = (
+                " The rejected name was removed from memory. Never say the rejected "
+                "name again, including in the acknowledgement."
+                if all_rejected_names
+                else " The earlier name was replaced."
+            )
+            return _tool_message(
+                f"Learned preference: {learned_summary}{removal_note}", runtime
+            )
 
     # The owner correcting a fact about the avatar is changing the avatar, which every
     # viewer reads; a preference lives under the owner's own user id and never reaches

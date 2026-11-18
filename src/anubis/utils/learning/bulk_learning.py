@@ -30,6 +30,11 @@ from typing import Any, Literal
 from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 
+from src.anubis.utils.learning.address_correction import (
+    extract_rejected_address_names,
+    known_user_address_names,
+    text_mentions_name,
+)
 from src.anubis.utils.learning.engagement import mark_sweep_complete
 from src.anubis.utils.learning.feedback import (
     list_unaggregated_ratings,
@@ -174,6 +179,10 @@ Infer the patterns the USER responds well to and the patterns the USER responds 
 Write each pattern as one complete standalone sentence about the USER's preference.
 Only infer patterns that several ratings support or that one rating states unambiguously. Never invent a preference the ratings do not show.
 </INSTRUCTIONS>
+
+<RESTRICTIONS>
+Never infer the USER's name, and never write a pattern that says what name to call the USER. A name inside a rated message is not evidence of the USER's name.
+</RESTRICTIONS>
 """
 
 
@@ -221,6 +230,12 @@ Infer:
 3. Statements the USER made about what feels real, authentic, or genuine about the avatar, and what feels fake, scripted, or off. Each must be one complete standalone sentence with the USER's own words as evidence.
 Only infer what the USER's own messages support. Never infer from the avatar's replies. Leave every list empty when the messages give no signal.
 </INSTRUCTIONS>
+
+<NAMES>
+A name the USER speaks in direct address ("David, I don't want you to be gone") is the name of the one the USER is speaking to. A name spoken in direct address is never the USER's own name and is never evidence of how the USER wants to be addressed.
+Infer an address preference only when the USER states the USER's own name ("my name is Sam") or asks to be called a name ("call me Sam"). When the USER does neither, write no address preference.
+When the USER rejects a name ("do not call me Alex", "my name is not Alex"), never write the rejected name in any preference, statement, or evidence. Write only the name the USER wants ("Address the user as Sam."). When the USER rejects a name without stating a wanted name, write nothing about names.
+</NAMES>
 """
 
 
@@ -297,8 +312,37 @@ async def infer_preferences_from_conversation(
         if isinstance(response, InferredUserPreferences)
         else InferredUserPreferences.model_validate(response)
     )
+    # Names are guarded in code as well as in the prompt, because a wrongly
+    # inferred name is repeated to the user in every later conversation. A name
+    # the user rejected in this conversation is never stored by the sweep, and
+    # an inferred address preference must agree with the name the user stated.
+    # The sweep only filters the sweep's own inferences: the sweep never deletes
+    # a stored record, because the sweep re-reads old messages, and a name the
+    # user rejected in an old message may be a name the user has since taken
+    # back. Deleting is done once, when the user says the words
+    # (``apply_names_stated_in_message``).
+    rejected_names: list[str] = []
+    for user_text in user_texts:
+        for rejected_name in extract_rejected_address_names(user_text):
+            if rejected_name.lower() not in {name.lower() for name in rejected_names}:
+                rejected_names.append(rejected_name)
+    stated_names = await known_user_address_names(store, user_id, assistant_id)
+
+    def _mentions_rejected_name(text: str) -> bool:
+        return any(text_mentions_name(text, name) for name in rejected_names)
+
     stored = 0
     for preference in inferred.preferences:
+        if _mentions_rejected_name(preference.preference) or _mentions_rejected_name(
+            preference.evidence
+        ):
+            continue
+        if preference.category == "address" and stated_names and not any(
+            text_mentions_name(preference.preference, name) for name in stated_names
+        ):
+            # The user stated the user's own name; an inferred address preference
+            # that names nobody or names somebody else is dropped.
+            continue
         document = await store_user_preference(
             store,
             user_id,
@@ -321,6 +365,10 @@ async def infer_preferences_from_conversation(
         )
         stored += document is not None
     for realness in inferred.what_feels_real:
+        if _mentions_rejected_name(realness.statement) or _mentions_rejected_name(
+            realness.evidence
+        ):
+            continue
         document = await store_what_feels_real(
             store,
             user_id,

@@ -10115,8 +10115,13 @@ async def message_avatar(
     turn_kind: Optional[str] = Form(None),
     connection_key: Optional[str] = Form(None),
     owner_location: Optional[str] = Form(None),
+    evaluation: bool = Form(False),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
+    # ``evaluation=true`` marks the turn as one question of an evaluation run
+    # (``scripts/evaluate_avatar_against_transcripts.py``): the words are an
+    # interviewer's words replayed from a transcript, not the caller's own, so
+    # the learning observation is skipped. Honoured for the administrator only.
     # ``ambient_action_observation_id`` names a notification card whose offer
     # the conversation partner just allowed: the turn is a hidden instruction
     # to carry out ``ambient_action_description`` (``ambient_action`` is the
@@ -10453,6 +10458,16 @@ async def message_avatar(
         )
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
+    if (
+        evaluation
+        and not is_anonymous_user(current_user)
+        and is_unbannable_administrator(user_id=user_id, context=request.app.state.context)
+    ):
+        # A replayed interview question is not the administrator's own words:
+        # the question must not move engagement, sentiment, the avatar's
+        # current emotion, or the administrator's own avatar's training data.
+        config["configurable"]["skip_observation"] = True
+        config["configurable"]["evaluation_run"] = True
     if owner_location and not is_anonymous_user(current_user):
         parts = [part.strip() for part in str(owner_location).split(",")]
         if len(parts) == 2:
@@ -13945,6 +13960,42 @@ async def _poll_training_voice_clones(context: Any) -> None:
             logger.debug("Voice training poller iteration failed", exc_info=True)
 
 
+async def _record_isolation_diarization_usage(
+    isolated: dict, *, user_id: str, assistant_id: str
+) -> None:
+    """Record the diarizer call a voice-route isolation paid for.
+
+    ``isolate_dominant_speaker_audio_b64`` returns the diarizer response of the
+    isolation's own paid call under ``diarization_response`` (``None`` when the
+    isolation reused a diarization that was already recorded). Before
+    2026-11-17 no voice route recorded that call, so the cost never reached
+    ``api_metrics``. Best-effort: accounting never fails the request.
+    """
+    diarization_response = (isolated or {}).get("diarization_response")
+    if not diarization_response:
+        return
+    try:
+        prompt_tokens = int(diarization_response.get("input_tokens") or 0)
+        completion_tokens = int(diarization_response.get("output_tokens") or 0)
+        await persist_api_metrics_row(
+            app.state.pool,
+            inference_type="diarization",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=int(
+                diarization_response.get("total_tokens")
+                or (prompt_tokens + completion_tokens)
+            ),
+            cost_usd=float(diarization_response.get("total_cost") or 0.0),
+            latency_ms=float(diarization_response.get("latency_ms") or 0.0),
+            user_id=user_id,
+            assistant_id=assistant_id,
+            model_name=diarization_response.get("model"),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not record isolation diarization metrics", exc_info=True)
+
+
 def _voice_repository_or_503() -> Any:
     from src.anubis.utils.media_assets import get_media_asset_repository
     from src.anubis.utils.voice.corpus import voice_configured
@@ -14099,6 +14150,9 @@ async def add_avatar_voice_sample(
             status_code=400,
             detail=f"The recording could not be processed: {isolation_error}",
         )
+    await _record_isolation_diarization_usage(
+        isolated, user_id=user_id, assistant_id=assistant_id
+    )
     seconds = float(isolated.get("duration") or 0.0)
     clip_uri = isolated.get("audio_base64_preprocessed") or ""
     if seconds <= 0 or not clip_uri:
@@ -14128,12 +14182,18 @@ async def add_avatar_voice_sample(
     )
     if stored_anchor is None:
         try:
+            # The take was diarized once above; the anchor is cut from that
+            # same diarization, so no second diarizer call is paid for.
             anchor = await isolate_dominant_speaker_audio_b64(
                 data_uri,
                 context=app.state.context,
                 filename=sample_filename,
                 content_type=mime_type,
                 reference_audio=True,
+                diarization=isolated.get("diarization_response"),
+            )
+            await _record_isolation_diarization_usage(
+                anchor, user_id=user_id, assistant_id=assistant_id
             )
             # A take the isolation could not cut a single-speaker clip from is
             # not stored: an anchor the diarizer rejects is worse than no anchor,
@@ -14502,6 +14562,9 @@ async def set_avatar_voice_reference(
             status_code=400,
             detail=f"The clip could not be prepared as a reference: {isolation_error}",
         )
+    await _record_isolation_diarization_usage(
+        anchor, user_id=current_user["identities"][0]["user_id"], assistant_id=assistant_id
+    )
     anchor_uri = anchor.get("audio_base64_preprocessed") or ""
     anchor_rejection = reference_clip_rejection(
         audio_data_uri=anchor_uri,

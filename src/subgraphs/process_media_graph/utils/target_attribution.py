@@ -226,3 +226,124 @@ async def adjudicate_target_speaker_labels(
             attribution_error,
         )
         return None
+
+
+class AvatarSpeakerIdentification(BaseModel):
+    """Which diarized speaker labels are the named avatar, judged from text."""
+
+    verdict: Literal["identified", "absent", "undetermined"]
+    avatar_speaker_labels: List[str]
+    confidence: Literal["high", "medium", "low"]
+    evidence_summary: str
+
+
+AVATAR_SPEAKER_IDENTIFICATION_TRANSCRIPT_CHARACTER_LIMIT = 60000
+
+
+def _transcript_excerpt_for_identification(
+    turns: List[Dict[str, Any]], character_limit: int
+) -> str:
+    """Render the transcript, keeping the opening and closing when too long.
+
+    Introductions and sign-offs carry most of the naming evidence, so an
+    over-long transcript keeps the first two thirds of the character limit
+    from the opening and the last third from the closing.
+    """
+    full_transcript = _render_labeled_transcript(turns)
+    if len(full_transcript) <= character_limit:
+        return full_transcript
+    opening_character_count = (character_limit * 2) // 3
+    closing_character_count = character_limit - opening_character_count
+    return (
+        full_transcript[:opening_character_count]
+        + "\n[... middle of the transcript omitted ...]\n"
+        + full_transcript[-closing_character_count:]
+    )
+
+
+async def identify_avatar_speaker_labels(
+    turns: List[Dict[str, Any]],
+    *,
+    avatar_name: Optional[str],
+) -> Optional[AvatarSpeakerIdentification]:
+    """Decide from the transcript which speaker labels are the named avatar.
+
+    The reference identity check. A promoted reference upload has no voice
+    reference yet, and the dominant speaker by talk time can be the
+    interviewer. One text-only structured-output call over the transcript the
+    diarizer call already paid for reads self-introductions and address by
+    name. No audio is sent, so the identity check adds no speech cost.
+
+    Returns ``None`` when the avatar has no name, the transcript is empty, or
+    the call fails; the caller then keeps the dominant-speaker rule. Only a
+    "high" or "medium" confidence verdict is returned as decisive: a "low"
+    confidence verdict is downgraded to "undetermined" with no labels.
+    """
+    cleaned_avatar_name = (avatar_name or "").strip()
+    distinct_labels = _distinct_labels_in_order(turns)
+    if not cleaned_avatar_name or not distinct_labels:
+        return None
+
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        from src.anubis.utils.model import init_model
+        from src.anubis.utils.prompts.target_speaker_attribution_prompt import (
+            AVATAR_SPEAKER_IDENTIFICATION_SYSTEM_PROMPT,
+        )
+
+        human_message = "\n\n".join(
+            [
+                f"Avatar name: {cleaned_avatar_name}",
+                "Every distinct speaker label:\n"
+                + "\n".join(f"- {label}" for label in distinct_labels),
+                "Labeled transcript (one turn per line as 'speaker_label: text'):\n"
+                + _transcript_excerpt_for_identification(
+                    turns, AVATAR_SPEAKER_IDENTIFICATION_TRANSCRIPT_CHARACTER_LIMIT
+                ),
+            ]
+        )
+        model = init_model(
+            model_without_tools=False,
+            response_format=AvatarSpeakerIdentification,
+        )
+        response = await model.ainvoke(
+            input=[
+                SystemMessage(content=AVATAR_SPEAKER_IDENTIFICATION_SYSTEM_PROMPT),
+                HumanMessage(content=human_message),
+            ]
+        )
+    except Exception as identification_error:  # noqa: BLE001 - best-effort pass
+        logger.warning(
+            "avatar speaker identification failed (%s); keeping the "
+            "dominant-speaker rule",
+            identification_error,
+        )
+        return None
+
+    verdict = getattr(response, "verdict", None)
+    if verdict not in ("identified", "absent", "undetermined"):
+        return None
+    confidence = getattr(response, "confidence", "low")
+    evidence_summary = str(getattr(response, "evidence_summary", "") or "")
+    valid_labels = set(distinct_labels)
+    avatar_speaker_labels = [
+        label
+        for label in (getattr(response, "avatar_speaker_labels", None) or [])
+        if label in valid_labels
+    ]
+    if confidence not in ("high", "medium") or (
+        verdict == "identified" and not avatar_speaker_labels
+    ):
+        return AvatarSpeakerIdentification(
+            verdict="undetermined",
+            avatar_speaker_labels=[],
+            confidence="low",
+            evidence_summary=evidence_summary,
+        )
+    return AvatarSpeakerIdentification(
+        verdict=verdict,
+        avatar_speaker_labels=avatar_speaker_labels if verdict == "identified" else [],
+        confidence=confidence,
+        evidence_summary=evidence_summary,
+    )

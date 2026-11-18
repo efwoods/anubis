@@ -122,6 +122,7 @@ class DynamicPromptBuilder:
         conversation_sentiment_history: str | None = None,
         what_feels_real: str | None = None,
         user_preferences: str | None = None,
+        user_address_preferences: str | None = None,
     ) -> ChatPromptTemplate:
         """
         Build a ChatPromptTemplate with optional components.
@@ -290,6 +291,7 @@ class DynamicPromptBuilder:
             "conversation_sentiment_history": conversation_sentiment_history or "",
             "what_feels_real": what_feels_real or "",
             "user_preferences": user_preferences or "",
+            "user_address_preferences": user_address_preferences or "",
             "system_time": system_time,
             "learn_information_prompt_str": learn_information_prompt_str,
         }

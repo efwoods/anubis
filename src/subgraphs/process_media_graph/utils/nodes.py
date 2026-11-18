@@ -150,8 +150,15 @@ async def _collect_voice_clip_from_isolated_audio(
     audio_uri: str,
     filename: str | None,
     source_document_name: str | None,
+    diarization: dict | None = None,
+    target_speaker_labels: list[str] | None = None,
 ) -> float:
     """Isolate the dominant speaker across a reference recording and store it as a clip.
+
+    ``diarization`` is the diarizer response the upload already paid for; with
+    ``diarization`` given, the isolation cuts the clip from that response and
+    makes no diarizer call. ``target_speaker_labels`` names the labels the
+    reference identity check assigned to the avatar.
 
     Returns the seconds stored, which is zero when the isolation found no single
     speaker or anything failed, so the caller can fall back to cutting the
@@ -178,6 +185,13 @@ async def _collect_voice_clip_from_isolated_audio(
             content_type="audio/mp3",
             reference_audio=False,
             allow_single_speaker=True,
+            diarization=diarization,
+            target_speaker_labels=target_speaker_labels,
+        )
+        # An isolation that made a diarizer call of the isolation's own is a
+        # paid call and is recorded like every other speech call.
+        await record_speech_api_usage(
+            isolated.get("diarization_response"), config, user_id, assistant_id
         )
         isolated_seconds = float(isolated.get("duration") or 0.0)
         isolated_audio = isolated.get("audio_base64_preprocessed") or ""
@@ -214,6 +228,76 @@ async def _collect_voice_clip_from_isolated_audio(
             "Voice clip collection skipped for %s: %s", assistant_id, clip_error
         )
         return 0.0
+
+
+async def _diarize_promoted_reference_upload(
+    audio_uri: str,
+    audio_name: Optional[str],
+    context: Any,
+    config: Any,
+    user_id: str,
+    assistant_id: str,
+) -> Dict[str, Any]:
+    """Make and record the single diarizer call of a promoted reference upload.
+
+    No reference clip exists yet, so the call is made without one, and every
+    speaker label of a chunked recording is prefixed with the chunk index so
+    two different people never share one label.
+    """
+    diarization = await transcribe_audio_diarize(
+        media_base64=audio_uri,
+        context=context,
+        encoded_reference_audio=None,
+        filename=audio_name,
+        content_type="audio/mp3",
+        namespace_chunk_labels_without_reference=True,
+    )
+    await record_speech_api_usage(diarization, config, user_id, assistant_id)
+    return diarization
+
+
+def _relabel_reference_speaker_segments(
+    diarization: Dict[str, Any],
+    *,
+    reference_written: bool,
+    avatar_speaker_labels: Optional[List[str]],
+    known_speaker_label: str,
+) -> Dict[str, Any]:
+    """Return the promoted upload's diarization with the avatar's turns labelled.
+
+    A promoted reference upload is diarized once, without a reference clip, so
+    no segment carries the known-speaker label. When the reference clip was
+    written from this upload, the speaker the clip was cut from IS the avatar:
+    the labels the reference identity check named, or else the speaker with
+    the most talk time (the same selection ``isolate_dominant_speaker_audio_b64``
+    made). Those segments are relabelled to ``known_speaker_label`` so the
+    dialogue routing below reads the response exactly as the routing reads a
+    diarizer call that was given the reference clip.
+
+    When no reference clip was written, the response is returned unchanged:
+    nobody in the recording was established as the avatar.
+    """
+    if not reference_written:
+        return diarization
+    segments = [
+        dict(segment)
+        for segment in (diarization.get("segments") or [])
+        if isinstance(segment, dict)
+    ]
+    labels = {str(label) for label in (avatar_speaker_labels or [])}
+    if not labels:
+        from src.anubis.utils.utility import _select_dominant_speaker_segments
+
+        selection = _select_dominant_speaker_segments(
+            segments, allow_single_speaker=True
+        )
+        if selection is None:
+            return diarization
+        labels = {selection[0]}
+    for segment in segments:
+        if str(segment.get("speaker") or "unknown") in labels:
+            segment["speaker"] = known_speaker_label
+    return {**diarization, "segments": segments}
 
 
 async def _learn_motion_from_video(
@@ -487,6 +571,7 @@ from src.subgraphs.process_media_graph.utils.helper_functions import (
     build_all_speakers_quote_documents,
     build_target_speech_identity_documents,
     coalesce_segments_by_speaker,
+    merge_interleaved_fragments,
     process_dialogue_json_to_documents,
     process_nontarget_text_to_identity_documents,
     process_text_media_item_target_for_vectorstore,
@@ -2184,10 +2269,11 @@ async def process_media_item_task(
                 ]
 
             if bool(metadata.get("reference_media")):
-                from src.anubis.utils.utility import (
-                    extract_video_audio_b64,
-                    transcribe_audio,
-                )
+                # ``extract_video_audio_b64`` and ``transcribe_audio`` are the
+                # module-level imports. Importing either name again inside this
+                # function makes the name local to the whole function, and the
+                # fallback transcription at the end of the audio branch then
+                # fails with UnboundLocalError.
                 from src.subgraphs.process_media_graph.utils.helper_functions import (
                     store_explicit_reference_media_documents,
                 )
@@ -2291,6 +2377,58 @@ async def process_media_item_task(
             # ---------------------------------------------------------------
             voice_clip_collected_for_item = False
             reference_written = False
+            # The single diarizer response of a promoted reference upload, the
+            # speaker labels the reference identity check assigned to the
+            # avatar (``None`` keeps the dominant-speaker rule), and whether
+            # that single diarizer call failed.
+            promoted_upload_diarization: Optional[Dict[str, Any]] = None
+            promoted_avatar_speaker_labels: Optional[List[str]] = None
+            promoted_upload_diarization_failed = False
+
+            # A source that publishes a speaker-labelled transcript of this
+            # exact video has already named every speaker, so no audio is sent
+            # to a diarizer. ``published_diarization`` holds the published
+            # transcript with the speakers' published names;
+            # ``published_avatar_speaker_names`` holds the published names that
+            # are the avatar's name.
+            published_diarization: Optional[Dict[str, Any]] = None
+            published_avatar_speaker_names: List[str] = []
+            if (
+                str(
+                    getattr(runtime.context, "published_transcript_lookup_enabled", None)
+                    or "TRUE"
+                ).upper()
+                == "TRUE"
+                and _assistant_name(config)
+                and not create_reference_media_from_playlist
+            ):
+                from src.anubis.utils.speech.published_transcripts import (
+                    load_published_transcript_as_diarization,
+                    speaker_name_matches_avatar,
+                )
+
+                published_diarization = await load_published_transcript_as_diarization(
+                    metadata.get("source") or filename
+                )
+                if published_diarization is not None:
+                    published_avatar_speaker_names = sorted(
+                        {
+                            str(segment["speaker"])
+                            for segment in published_diarization["segments"]
+                            if speaker_name_matches_avatar(
+                                str(segment["speaker"]), _assistant_name(config)
+                            )
+                        }
+                    )
+                    _emit_media_progress(
+                        "published_transcript_used",
+                        filename=filename,
+                        transcript_url=published_diarization.get(
+                            "published_transcript_url"
+                        ),
+                        segments=len(published_diarization["segments"]),
+                        avatar_is_a_speaker=bool(published_avatar_speaker_names),
+                    )
             if (media_type == "audio" or media_type == "video") and reference_audio:
                 # Reference clip pipeline: extract a single-speaker, speech-bearing
                 # mp3 (the dominant speaker by total speech time across diarized,
@@ -2342,13 +2480,95 @@ async def process_media_item_task(
                             reason=source_rejection,
                         )
                     else:
-                        transcription_dict = await isolate_dominant_speaker_audio_b64(
-                            audio_uri,
-                            context=runtime.context,
-                            filename=audio_name,
-                            content_type="audio/mp3",
-                            reference_audio=True,
-                        )
+                        # Diarize once. The one response below is reused for the
+                        # reference clip, the voice-clone track and the dialogue
+                        # documents; before 2026-11-17 the same audio was sent
+                        # to the diarizer three times and two of the three calls
+                        # were never recorded.
+                        try:
+                            if published_diarization is not None:
+                                # The published transcript stands in for the
+                                # diarizer call; nothing is paid or recorded.
+                                promoted_upload_diarization = published_diarization
+                            else:
+                                promoted_upload_diarization = await _diarize_promoted_reference_upload(
+                                    audio_uri,
+                                    audio_name,
+                                    runtime.context,
+                                    config,
+                                    user_id,
+                                    assistant_id,
+                                )
+                        except Exception as promoted_diarization_error:
+                            logger.exception(
+                                "Diarizing the promoted reference upload %s failed: %s",
+                                filename,
+                                promoted_diarization_error,
+                            )
+                            promoted_upload_diarization = None
+                            promoted_upload_diarization_failed = True
+
+                        # Reference identity check. A published transcript
+                        # names the avatar outright. Otherwise a text-only call
+                        # over the transcript already paid for decides which
+                        # speaker labels are the avatar, so an interviewer who
+                        # talks more than the avatar is never stored as the
+                        # anchor.
+                        avatar_absent_from_recording = False
+                        if published_diarization is not None:
+                            if published_avatar_speaker_names:
+                                promoted_avatar_speaker_labels = list(
+                                    published_avatar_speaker_names
+                                )
+                            else:
+                                avatar_absent_from_recording = True
+                        elif promoted_upload_diarization is not None:
+                            from src.subgraphs.process_media_graph.utils.target_attribution import (
+                                identify_avatar_speaker_labels,
+                            )
+
+                            identification = await identify_avatar_speaker_labels(
+                                coalesce_segments_by_speaker(
+                                    promoted_upload_diarization.get("segments") or []
+                                ),
+                                avatar_name=_assistant_name(config),
+                            )
+                            if identification is not None:
+                                _emit_media_progress(
+                                    "reference_identity_check",
+                                    filename=filename,
+                                    verdict=identification.verdict,
+                                    confidence=identification.confidence,
+                                    avatar_speaker_labels=identification.avatar_speaker_labels,
+                                )
+                                if identification.verdict == "identified":
+                                    promoted_avatar_speaker_labels = list(
+                                        identification.avatar_speaker_labels
+                                    )
+                                elif identification.verdict == "absent":
+                                    avatar_absent_from_recording = True
+
+                        if promoted_upload_diarization is None:
+                            transcription_dict = {}
+                        elif avatar_absent_from_recording:
+                            transcription_dict = {}
+                            logger.info(
+                                "No reference clip stored from %s for %s: the "
+                                "transcript shows that %s is not a speaker",
+                                filename,
+                                assistant_id,
+                                _assistant_name(config),
+                            )
+                        else:
+                            transcription_dict = await isolate_dominant_speaker_audio_b64(
+                                audio_uri,
+                                context=runtime.context,
+                                filename=audio_name,
+                                content_type="audio/mp3",
+                                reference_audio=True,
+                                diarization=promoted_upload_diarization,
+                                target_speaker_labels=promoted_avatar_speaker_labels,
+                            )
                         # The helper returns a coherent triple: the encoded mp3 of
                         # the dominant speaker's clip, its duration, and the
                         # transcript ``text`` that matches that clip.
@@ -2375,6 +2595,8 @@ async def process_media_item_task(
                                 runtime.context, "reference_audio_minimum_seconds", None
                             ),
                         )
+                        if avatar_absent_from_recording:
+                            clip_rejection = "avatar_not_a_speaker_in_recording"
                         if clip_rejection is not None:
                             logger.info(
                                 "No reference clip stored from %s for %s: %s",
@@ -2419,6 +2641,8 @@ async def process_media_item_task(
                         audio_uri=audio_uri,
                         filename=audio_name,
                         source_document_name=filename,
+                        diarization=promoted_upload_diarization,
+                        target_speaker_labels=promoted_avatar_speaker_labels,
                     )
                     # Only a clip that was actually stored replaces the
                     # target-turn cut below; an isolation that stored nothing
@@ -2530,16 +2754,51 @@ async def process_media_item_task(
             # decide whether "this is the avatar" may be presumed at all.
             diarization_failed = False
             try:
-                diar_response = await transcribe_audio_diarize(
-                    media_base64=payload_uri,
-                    context=runtime.context,
-                    encoded_reference_audio=encoded_reference_audio,
-                    filename=filename,
-                    content_type=content_type,
-                )
-                await record_speech_api_usage(
-                    diar_response, config, user_id, assistant_id
-                )
+                if published_diarization is not None:
+                    # The published transcript names every speaker. The
+                    # avatar's turns take the known-speaker label; every other
+                    # speaker keeps the published name.
+                    diar_response = _relabel_reference_speaker_segments(
+                        published_diarization,
+                        reference_written=True,
+                        avatar_speaker_labels=published_avatar_speaker_names
+                        or ["<no published speaker is the avatar>"],
+                        known_speaker_label=(
+                            runtime.context.audio_diarization_known_speaker_name
+                            or "avatar"
+                        ),
+                    )
+                elif promoted_upload_diarization is not None:
+                    # The promoted reference upload was already diarized above
+                    # and that call was already recorded. Reuse the response:
+                    # the segments the reference clip was cut from are the
+                    # avatar's, so those segments take the known-speaker label
+                    # that a diarizer call with the reference would have given.
+                    diar_response = _relabel_reference_speaker_segments(
+                        promoted_upload_diarization,
+                        reference_written=reference_written,
+                        avatar_speaker_labels=promoted_avatar_speaker_labels,
+                        known_speaker_label=(
+                            runtime.context.audio_diarization_known_speaker_name
+                            or "avatar"
+                        ),
+                    )
+                elif promoted_upload_diarization_failed:
+                    raise RuntimeError(
+                        "the single diarization call of the promoted reference "
+                        "upload failed"
+                    )
+                else:
+                    diar_response = await transcribe_audio_diarize(
+                        media_base64=payload_uri,
+                        context=runtime.context,
+                        encoded_reference_audio=encoded_reference_audio,
+                        filename=filename,
+                        content_type=content_type,
+                    )
+                    await record_speech_api_usage(
+                        diar_response, config, user_id, assistant_id
+                    )
             except Exception as e:
                 logger.exception(
                     "transcribe_audio_diarize failed for %s: %s; falling back to plain transcribe",
@@ -2570,6 +2829,12 @@ async def process_media_item_task(
             target_speaker_label = (
                 runtime.context.audio_diarization_known_speaker_name or "avatar"
             )
+            # ``target_speaker_label`` is the diarizer's label for the avatar's
+            # turns and is not a person's name. Everything that needs the
+            # person's name (fact extraction, scene summaries, document
+            # metadata) receives the avatar's real name, so the label "avatar"
+            # never reaches a stored fact as though "avatar" were a name.
+            avatar_target_name = _assistant_name(config) or target_speaker_label
 
             # ---------------------------------------------------------------
             # create_reference_media_from_playlist: no single target speaker, so EVERY detected
@@ -2683,7 +2948,9 @@ async def process_media_item_task(
                     # statement as its question; the first is synthesized
                     # downstream). No monologue is created for multi-speaker
                     # content — a monologue is the single-speaker case below.
-                    turns = coalesce_segments_by_speaker(statements)
+                    turns = coalesce_segments_by_speaker(
+                        merge_interleaved_fragments(statements)
+                    )
                     quote_media_item = {
                         "metadata": {"filename": filename, "source": source_label}
                     }
@@ -2692,7 +2959,7 @@ async def process_media_item_task(
                         user_id=user_id,
                         assistant_id=assistant_id,
                         media_item=quote_media_item,
-                        target_name=target_speaker_label,
+                        target_name=avatar_target_name,
                         multi_speaker=True,
                     )
                     for d in quote_documents:
@@ -2761,7 +3028,10 @@ async def process_media_item_task(
                     continue
                 speaker_label = seg.get("speaker") or "unknown"
                 is_target = (
-                    encoded_reference_audio is not None
+                    (
+                        encoded_reference_audio is not None
+                        or published_diarization is not None
+                    )
                     and target_speaker_label is not None
                     and target_speaker_label.lower() in str(speaker_label).lower()
                 )
@@ -2779,6 +3049,21 @@ async def process_media_item_task(
                     }
                 )
 
+            # Overlapping speech arrives as alternating sub-second pieces of two
+            # sentences; regroup the pieces per speaker before the turns are
+            # built so one sentence is one turn instead of several one-word
+            # quote documents.
+            normalized_segments = merge_interleaved_fragments(
+                normalized_segments,
+                fragment_maximum_seconds=float(
+                    getattr(
+                        runtime.context,
+                        "diarization_fragment_maximum_seconds",
+                        None,
+                    )
+                    or 1.0
+                ),
+            )
             turns = coalesce_segments_by_speaker(normalized_segments)
             distinct_speakers = {t["speaker"] for t in turns}
 
@@ -2807,6 +3092,8 @@ async def process_media_item_task(
             if (
                 enable_target_speaker_attribution
                 and encoded_reference_audio is not None
+                # A published transcript already names every speaker.
+                and published_diarization is None
                 and len(distinct_speakers) > 1
             ):
                 try:
@@ -2817,7 +3104,7 @@ async def process_media_item_task(
                     attribution_map = await adjudicate_target_speaker_labels(
                         turns,
                         reference_transcript_text=reference_transcript_text,
-                        target_name=target_speaker_label,
+                        target_name=avatar_target_name,
                         target_speaker_label=target_speaker_label,
                         context=runtime.context,
                     )
@@ -2883,6 +3170,7 @@ async def process_media_item_task(
             if (
                 single_raw_speaker
                 and encoded_reference_audio is not None
+                and published_diarization is None
                 and turns
                 and not any(t.get("is_target") for t in turns)
             ):
@@ -2935,7 +3223,7 @@ async def process_media_item_task(
                 # and biographical facts about the target from non-target turns.
                 dialogue_payload = {
                     "segments": turns,
-                    "target_name": target_speaker_label,
+                    "target_name": avatar_target_name,
                 }
                 dialogue_media_item = {
                     "type": "dialogue",
@@ -3000,7 +3288,7 @@ async def process_media_item_task(
                             user_id=user_id,
                             assistant_id=assistant_id,
                             media_item=single_media_item,
-                            target_name=target_speaker_label,
+                            target_name=avatar_target_name,
                         )
                     )
                 else:
@@ -3012,7 +3300,7 @@ async def process_media_item_task(
                         user_id=user_id,
                         assistant_id=assistant_id,
                         media_item=single_media_item,
-                        target_name=target_speaker_label,
+                        target_name=avatar_target_name,
                     )
                 for d in documents:
                     d.metadata.setdefault("audio_filename", filename)
@@ -3130,7 +3418,7 @@ async def process_media_item_task(
                     user_id=user_id,
                     assistant_id=assistant_id,
                     media_item=transcript_media_item,
-                    target_name=target_speaker_label,
+                    target_name=avatar_target_name,
                 )
             for d in documents:
                 d.metadata.setdefault("audio_filename", filename)

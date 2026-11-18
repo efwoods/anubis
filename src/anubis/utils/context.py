@@ -615,6 +615,93 @@ class GlobalContext:
         },
     )
 
+    audio_diarization_provider: str = field(
+        default="OPENAI",
+        metadata={
+            "description": "Which hosted diarizer media uploads are sent to: OPENAI (gpt-4o-transcribe-diarize, shut down by OpenAI on 2027-02-26), ASSEMBLYAI, DEEPGRAM or PYANNOTEAI. Env AUDIO_DIARIZATION_PROVIDER."
+        },
+    )
+
+    audio_diarization_job_timeout_seconds: float = field(
+        default=3600.0,
+        metadata={
+            "description": "How long to wait for an asynchronous hosted diarization job (AssemblyAI, pyannoteAI) before the upload item fails. Env AUDIO_DIARIZATION_JOB_TIMEOUT_SECONDS."
+        },
+    )
+
+    diarization_fragment_maximum_seconds: float = field(
+        default=1.0,
+        metadata={
+            "description": "A diarized segment shorter than this many seconds is a fragment of overlapping speech; runs of alternating fragments are regrouped per speaker before turns are built. Env DIARIZATION_FRAGMENT_MAXIMUM_SECONDS."
+        },
+    )
+
+    published_transcript_lookup_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE reads a speaker-labelled transcript published by the source of a YouTube video (for example lexfridman.com) instead of paying a diarizer for that video. Env PUBLISHED_TRANSCRIPT_LOOKUP_ENABLED."
+        },
+    )
+
+    assemblyai_api_key: str = field(
+        default=None,
+        metadata={"description": "AssemblyAI key for diarization. Env ASSEMBLYAI_API_KEY."},
+    )
+
+    assemblyai_speech_model: str = field(
+        default=None,
+        metadata={
+            "description": "AssemblyAI speech_model request value; empty uses AssemblyAI's default model. Env ASSEMBLYAI_SPEECH_MODEL."
+        },
+    )
+
+    assemblyai_price_per_hour: float = field(
+        default=0.0,
+        metadata={
+            "description": "US dollars AssemblyAI bills per hour of audio with speaker diarization, used to record the cost of each call. Env ASSEMBLYAI_PRICE_PER_HOUR."
+        },
+    )
+
+    deepgram_diarization_model: str = field(
+        default="nova-3",
+        metadata={
+            "description": "Deepgram model for pre-recorded diarization. Env DEEPGRAM_DIARIZATION_MODEL."
+        },
+    )
+
+    deepgram_price_per_hour: float = field(
+        default=0.0,
+        metadata={
+            "description": "US dollars Deepgram bills per hour of pre-recorded audio, used to record the cost of each call. Env DEEPGRAM_PRICE_PER_HOUR."
+        },
+    )
+
+    pyannoteai_api_key: str = field(
+        default=None,
+        metadata={"description": "pyannoteAI key for diarization. Env PYANNOTEAI_API_KEY."},
+    )
+
+    pyannoteai_diarization_model: str = field(
+        default="precision-2",
+        metadata={
+            "description": "pyannoteAI diarization model: precision-3, precision-2 or community-1 (transcription needs precision-2 or precision-3). Env PYANNOTEAI_DIARIZATION_MODEL."
+        },
+    )
+
+    pyannoteai_price_per_hour: float = field(
+        default=0.0,
+        metadata={
+            "description": "What pyannoteAI bills per hour of audio for diarization with transcription, in PYANNOTEAI_BILLING_CURRENCY. Env PYANNOTEAI_PRICE_PER_HOUR."
+        },
+    )
+
+    pyannoteai_billing_currency: str = field(
+        default="EUR",
+        metadata={
+            "description": "Currency of PYANNOTEAI_PRICE_PER_HOUR; pyannoteAI lists prices in euros. Env PYANNOTEAI_BILLING_CURRENCY."
+        },
+    )
+
     openai_speech_max_retries: int = field(
         default=4,
         metadata={

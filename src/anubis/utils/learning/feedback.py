@@ -48,7 +48,18 @@ WHAT_FEELS_REAL_POLARITIES = ("feels_real", "feels_fake")
 # words ("call me Sam") must still reach the prompt. The cap that keeps one
 # voluble user from crowding out the identity sections is the env-configurable
 # ``LEARNING_PROMPT_RETRIEVAL_LIMIT``.
+#
+# Address preferences (how the user wants to be named) are the exception: the
+# name applies to every reply, whatever the latest message is about, so address
+# preferences are never ranked by similarity. Every address preference is read,
+# sorted newest first, and rendered in a dedicated prompt section
+# (``load_address_preference_documents``). Ranking address preferences by
+# similarity is what let a stale "Address me as David" row outrank the user's
+# later correction on a message about a light switch (avatar 47cfdaa2,
+# 2026-11-18).
 _RATED_MESSAGE_CHARACTER_LIMIT = 800
+ADDRESS_PREFERENCE_CATEGORY = "address"
+_NAMESPACE_LISTING_PAGE_SIZE = 200
 
 
 def _utc_now_iso() -> str:
@@ -322,6 +333,74 @@ async def _search_documents(
     return documents
 
 
+async def list_namespace_items(store: Any, namespace: tuple) -> list[Any]:
+    """Every store item of ``namespace``, read page by page without a query."""
+    items: list[Any] = []
+    offset = 0
+    while True:
+        try:
+            page = await store.asearch(
+                namespace, limit=_NAMESPACE_LISTING_PAGE_SIZE, offset=offset
+            )
+        except Exception as listing_error:  # noqa: BLE001 - prompt sections are best effort
+            logger.debug("Learning listing failed for %s: %s", namespace, listing_error)
+            break
+        page = list(page or [])
+        items.extend(page)
+        if len(page) < _NAMESPACE_LISTING_PAGE_SIZE:
+            break
+        offset += _NAMESPACE_LISTING_PAGE_SIZE
+    return items
+
+
+def is_address_preference(document: Document) -> bool:
+    """Report whether ``document`` is a preference of the address category."""
+    return document.metadata.get("category") == ADDRESS_PREFERENCE_CATEGORY
+
+
+async def load_address_preference_documents(
+    store: Any, user_id: str, assistant_id: str
+) -> list[Document]:
+    """Return every address preference of the user, newest first.
+
+    Address preferences are read by category and by recency, never by
+    similarity to the latest message, so the newest name the user asked for
+    reaches every prompt. There is no cap: the user may change the name any
+    number of times, and a newly stated name replaces the earlier names in the
+    store (``address_correction.relearn_user_address_name``), so the list stays
+    short because the list is kept current, not because the list is truncated.
+    """
+    items = await list_namespace_items(store, preference_namespace(user_id, assistant_id))
+    address_documents = [
+        document
+        for document in (_item_document(item) for item in items)
+        if document is not None and is_address_preference(document)
+    ]
+    address_documents.sort(
+        key=lambda document: str(document.metadata.get("recorded_at") or ""),
+        reverse=True,
+    )
+    return address_documents
+
+
+def render_address_preferences(documents: list[Document]) -> str:
+    """Address preferences as prompt lines, newest first, without context quotes.
+
+    Only the preference sentence is rendered. The stored context is a quotation
+    of the conversation, and a quotation can contain a name that is not the
+    user's name.
+    """
+    lines: list[str] = []
+    for document in documents:
+        preference = str(document.metadata.get("fact") or "").strip()
+        if not preference:
+            continue
+        recorded_date = str(document.metadata.get("recorded_at") or "")[:10]
+        suffix = f" (recorded {recorded_date})" if recorded_date else ""
+        lines.append(f"- {preference}{suffix}")
+    return "\n".join(lines)
+
+
 async def list_thread_ratings(
     store: Any, user_id: str, assistant_id: str, thread_id: str
 ) -> list[dict[str, Any]]:
@@ -437,6 +516,7 @@ class LearningSections:
     conversation_sentiment_history: str = ""
     what_feels_real: str = ""
     user_preferences: str = ""
+    user_address_preferences: str = ""
     engagement_record: dict[str, Any] = field(default_factory=dict)
 
 
@@ -474,6 +554,7 @@ async def retrieve_learning_sections(
         history_documents,
         what_feels_real_documents,
         preference_documents,
+        address_preference_documents,
     ) = await asyncio.gather(
         load_engagement_record(store, user_id, assistant_id),
         _search_documents(
@@ -504,6 +585,7 @@ async def retrieve_learning_sections(
         _search_documents(
             store, preference_namespace(user_id, assistant_id), query=query, limit=limit
         ),
+        load_address_preference_documents(store, user_id, assistant_id),
     )
 
     # The sentiment namespace holds both the scalar running summaries and the
@@ -528,5 +610,16 @@ async def retrieve_learning_sections(
     )
     sections.conversation_sentiment_history = _join_documents(history_documents)
     sections.what_feels_real = _join_documents(what_feels_real_documents)
-    sections.user_preferences = _join_documents(preference_documents)
+    # Address preferences are rendered in the dedicated address section only, so a
+    # stale address preference cannot re-enter the prompt through similarity.
+    sections.user_preferences = _join_documents(
+        [
+            document
+            for document in preference_documents
+            if not is_address_preference(document)
+        ]
+    )
+    sections.user_address_preferences = render_address_preferences(
+        address_preference_documents
+    )
     return sections

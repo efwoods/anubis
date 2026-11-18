@@ -81,6 +81,7 @@ Describe how the USER has been feeling across the whole conversation, how that f
 Name the dominant emotions of the USER, the overall polarity of the USER's sentiment, and whether the USER's engagement is rising, steady, or falling.
 When a PREVIOUS_SUMMARY is provided, update that summary with the newest messages rather than starting over.
 Never describe the AVATAR's feelings. Never invent events that are not in the transcript.
+When the USER rejects a name ("do not call me Alex"), never write the rejected name in the summary. Write "the wrong name" in place of the rejected name, because the summary is read back to the AVATAR and a summary that repeats the rejected name teaches the AVATAR the rejected name.
 </INSTRUCTIONS>
 """
 

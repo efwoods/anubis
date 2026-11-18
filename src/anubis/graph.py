@@ -482,6 +482,18 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
                 "comparison_to_unmodified_llm_response_analysis": comparison_to_unmodified_llm_response_analysis
             }
         )
+        # The verdict above is a yes or no. The evaluation harness
+        # (``scripts/evaluate_avatar_against_transcripts.py``) scores how far a
+        # reply sits from each reference, so the measured distance and the
+        # threshold the verdict used are published beside the verdict.
+        avatar_response.response_metadata.setdefault("authenticity_distances", {}).update(
+            {
+                "squared_mahalanobis_distance_from_unmodified_llm_responses": float(
+                    M_d_square_synth_from_baseline_chatgpt[0]
+                ),
+                "unmodified_llm_response_threshold": float(baseline_response_threshold),
+            }
+        )
 
         # AVATAR SIGNATURE KEY PHRASES — the ``features`` block's
         # key_phrase_rate was measured against the ChatGPT BASELINE's phrases
@@ -700,6 +712,18 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             avatar_response.response_metadata.update(
                 {
                     "comparison_to_direct_quote_response_analysis": comparison_to_direct_quote_response_analysis
+                }
+            )
+            avatar_response.response_metadata.setdefault(
+                "authenticity_distances", {}
+            ).update(
+                {
+                    "squared_mahalanobis_distance_from_direct_quotes": float(
+                        M_d_square_synth_from_ground_truth_corpus[0]
+                    ),
+                    "direct_quote_threshold": float(
+                        ground_truth_text_empirical_threshold
+                    ),
                 }
             )
 

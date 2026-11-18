@@ -503,12 +503,33 @@ async def known_user_address_names(
     return names
 
 
+# The name an address preference asks for. A comma or a colon may stand between
+# the keyword and the name ("addressed by your first name, Evan").
 _ADDRESS_NAME_IN_PREFERENCE_PATTERN = re.compile(
-    r"(?i:\b(?:as|called|call\s+(?:me|the\s+user)|named?|name\s+is)\s+)[\"'“‘]?(" + _NAME_TOKEN + ")"
+    r"(?i:\b(?:as|called|call\s+(?:me|the\s+user)|named?|name\s+is)\s*[,:]?\s+)[\"'“‘]?("
+    + _NAME_TOKEN
+    + ")"
 )
 _USER_NAME_FACT_PATTERN = re.compile(
     r"(?i:\bmy\s+name\s+is\s+)[\"'“‘]?(" + _NAME_TOKEN + ")"
 )
+
+
+def _names_in_entries(entries: list[dict[str, str]], excluded_name: str) -> list[str]:
+    """Names of the user found in the facts of ``entries``, without ``excluded_name``."""
+    names: list[str] = []
+    for entry in entries:
+        fact = entry.get("fact") or ""
+        for pattern in (_USER_NAME_FACT_PATTERN, _ADDRESS_NAME_IN_PREFERENCE_PATTERN):
+            for match in pattern.finditer(fact):
+                name = _clean_name(match.group(1))
+                if (
+                    _is_usable_name(name)
+                    and name.lower() != excluded_name.lower()
+                    and name.lower() not in {existing.lower() for existing in names}
+                ):
+                    names.append(name)
+    return names
 
 
 async def relearn_user_address_name(
@@ -602,6 +623,39 @@ async def relearn_user_address_name(
             )
             if not dry_run:
                 await store.adelete(identity, key)
+    # An address preference phrased in a way the name pattern does not read can
+    # still carry a replaced name. Every address preference that mentions a
+    # replaced name is deleted, so the store never holds two names.
+    replaced_names = _names_in_entries(report.deleted, new_name)
+    if replaced_names:
+        deleted_preference_keys = {
+            entry["key"]
+            for entry in report.deleted
+            if entry["namespace"] == _namespace_label(preferences)
+        }
+        for item in await list_namespace_items(store, preferences):
+            document = _item_document(item)
+            if (
+                document is None
+                or document.metadata.get("category") != ADDRESS_PREFERENCE_CATEGORY
+            ):
+                continue
+            key = getattr(item, "key", None) or document.metadata.get("document_id")
+            fact = str(document.metadata.get("fact") or "")
+            if str(key) in deleted_preference_keys or not any(
+                text_mentions_name(fact, replaced_name) for replaced_name in replaced_names
+            ):
+                continue
+            report.deleted.append(
+                {
+                    "namespace": _namespace_label(preferences),
+                    "key": str(key),
+                    "fact": fact,
+                    "fact_context": str(document.metadata.get("fact_context") or ""),
+                }
+            )
+            if not dry_run:
+                await store.adelete(preferences, key)
     if dry_run:
         return report
     stored_preference = await store_user_preference(
@@ -629,20 +683,86 @@ async def relearn_user_address_name(
     return report
 
 
+async def apply_names_stated_in_message_with_reports(
+    store: Any, user_id: str, assistant_id: str, message_text: str
+) -> tuple[list[str], str | None, list[RejectedNamePurgeReport]]:
+    """Apply every name change the user states in ``message_text``; no model call.
+
+    Returns the rejected names, the newly stated name, and one report per store
+    change. A rejected name is purged; a name stated with "my name is" replaces
+    the earlier names.
+    """
+    rejected_names = extract_rejected_address_names(message_text)
+    stated_name = extract_stated_user_name(message_text)
+    reports: list[RejectedNamePurgeReport] = []
+    if rejected_names:
+        reports.extend(
+            await purge_names_rejected_in_message(store, user_id, assistant_id, message_text)
+        )
+    if stated_name:
+        reports.append(
+            await relearn_user_address_name(
+                store, user_id, assistant_id, new_name=stated_name, replaces_name_fact=True
+            )
+        )
+    return rejected_names, stated_name, reports
+
+
 async def apply_names_stated_in_message(
     store: Any, user_id: str, assistant_id: str, message_text: str
 ) -> tuple[list[str], str | None]:
     """Apply every name change the user states in ``message_text``; no model call.
 
-    Returns the rejected names and the newly stated name. A rejected name is
-    purged; a name stated with "my name is" replaces the earlier names.
+    Returns the rejected names and the newly stated name.
     """
-    rejected_names = extract_rejected_address_names(message_text)
-    stated_name = extract_stated_user_name(message_text)
-    if rejected_names:
-        await purge_names_rejected_in_message(store, user_id, assistant_id, message_text)
-    if stated_name:
-        await relearn_user_address_name(
-            store, user_id, assistant_id, new_name=stated_name, replaces_name_fact=True
-        )
+    rejected_names, stated_name, _reports = await apply_names_stated_in_message_with_reports(
+        store, user_id, assistant_id, message_text
+    )
     return rejected_names, stated_name
+
+
+REJECTED_NAME_LEARNED_FACT = "The user rejected a name."
+
+
+def learned_fact_entries_for_name_reports(
+    rejected_names: list[str],
+    stated_name: str | None,
+    reports: list[RejectedNamePurgeReport],
+) -> list[dict[str, str]]:
+    """Describe the name changes in ``reports`` as learned-fact badge entries.
+
+    Each entry carries ``fact``, ``kind``, ``status`` and, for a replaced name,
+    ``previous_fact``. A rejected name is never written into an entry.
+    """
+    entries: list[dict[str, str]] = []
+    rejected_lowercase = {name.lower() for name in rejected_names}
+    if any(
+        report.rejected_name and (report.deleted or report.rewritten) for report in reports
+    ):
+        entries.append(
+            {"fact": REJECTED_NAME_LEARNED_FACT, "kind": "preference", "status": "removed"}
+        )
+    if not stated_name:
+        return entries
+    address_fact = f"Address the user as {stated_name}."
+    name_fact = f"My name is {stated_name}."
+    wrote_stated_name = any(
+        written.get("fact") in (address_fact, name_fact)
+        for report in reports
+        for written in report.written
+    )
+    replaced_names = [
+        name
+        for report in reports
+        if not report.rejected_name
+        for name in _names_in_entries(report.deleted, stated_name)
+        if name.lower() not in rejected_lowercase
+    ]
+    entry = {"fact": address_fact, "kind": "preference", "status": "known"}
+    if replaced_names:
+        entry["status"] = "updated"
+        entry["previous_fact"] = f"Address the user as {replaced_names[0]}."
+    elif wrote_stated_name:
+        entry["status"] = "learned"
+    entries.append(entry)
+    return entries

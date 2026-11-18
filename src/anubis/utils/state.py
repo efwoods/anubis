@@ -303,6 +303,15 @@ class GlobalState(TypedDict):
     # anything is indexed, analyzed, or turned into training data.
     moderation_violation: dict
 
+    """ Names learned while the system prompt was built """
+
+    # The name changes ``load_consciousness`` applied from the latest human
+    # message: ``{"message_id": <human message id>, "facts": [<badge entry>]}``.
+    # ``think`` adds the facts to the reply's ``learned_facts``; the message id
+    # keeps a second ``load_consciousness`` pass in the same turn from announcing
+    # the same name twice.
+    name_facts_learned_in_turn: Optional[Dict[str, Any]] = None
+
     """ Conversation compaction """
 
     # The deep agent's summarization event (cutoff index + summary message),

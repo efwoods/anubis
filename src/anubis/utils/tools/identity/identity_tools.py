@@ -1826,6 +1826,17 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
             fact_names_user_with_rejected_name(user_fact, rejected_user_name)
             for rejected_user_name in all_rejected_user_names
         ):
+            from src.anubis.utils.learning.address_correction import (
+                REJECTED_NAME_LEARNED_FACT,
+            )
+            from src.anubis.utils.learning.fact_learned import (
+                STATUS_REMOVED,
+                announce_fact_learned,
+            )
+
+            announce_fact_learned(
+                REJECTED_NAME_LEARNED_FACT, kind="preference", status=STATUS_REMOVED
+            )
             return Command(
                 update={
                     "messages": [

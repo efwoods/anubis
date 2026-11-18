@@ -85,10 +85,29 @@ def pipeline(monkeypatch):
     """Stub the audio work; record what the pipeline did."""
     repository = InMemoryMediaAssetRepository()
     media_repository.set_media_asset_repository(repository)
-    recorded = {"isolations": [], "similarity": 0.1, "classified": []}
+    recorded = {
+        "isolations": [],
+        "similarity": 0.1,
+        "classified": [],
+        "diarizer_calls": [],
+        "isolations_that_reused_a_diarization": [],
+        "isolation_target_speaker_labels": [],
+    }
 
-    async def fake_isolate(audio_uri, *, context, filename, content_type, reference_audio=False, allow_single_speaker=None):
+    async def fake_isolate(
+        audio_uri,
+        *,
+        context,
+        filename,
+        content_type,
+        reference_audio=False,
+        allow_single_speaker=None,
+        diarization=None,
+        target_speaker_labels=None,
+    ):
         recorded["isolations"].append((filename, bool(reference_audio)))
+        recorded["isolations_that_reused_a_diarization"].append(diarization is not None)
+        recorded["isolation_target_speaker_labels"].append(target_speaker_labels)
         seconds = 3.0 if reference_audio else 30.0
         return {
             "audio_base64_preprocessed": CLIP,
@@ -97,6 +116,7 @@ def pipeline(monkeypatch):
         }
 
     async def fake_diarize(*, media_base64, context, encoded_reference_audio, filename, content_type, **_ignored):
+        recorded["diarizer_calls"].append(filename)
         return {
             "text": "One. Two.",
             "segments": [
@@ -125,6 +145,18 @@ def pipeline(monkeypatch):
     monkeypatch.setattr(nodes_mod, "isolate_dominant_speaker_audio_b64", fake_isolate)
     monkeypatch.setattr(nodes_mod, "transcribe_audio_diarize", fake_diarize)
     monkeypatch.setattr(nodes_mod, "process_text_to_document", fake_classify)
+
+    # The target-speech fact extraction calls a model. Left unstubbed, every
+    # test that reaches the target-speech path made a live network call and
+    # stalled whenever the model endpoint was slow to refuse the request.
+    async def fake_target_speech_identity_documents(turns, **_kwargs):
+        return []
+
+    monkeypatch.setattr(
+        nodes_mod,
+        "build_target_speech_identity_documents",
+        fake_target_speech_identity_documents,
+    )
     monkeypatch.setattr(nodes_mod.asyncio, "to_thread", fake_to_thread)
     monkeypatch.setattr(
         "src.anubis.utils.voice.clips.cut_target_turns_to_mp3_data_uri", fake_cut
@@ -221,7 +253,15 @@ async def test_an_upload_with_no_isolated_clip_stores_no_reference(pipeline, mon
     """
 
     async def fake_isolate_without_a_clip(
-        audio_uri, *, context, filename, content_type, reference_audio=False, allow_single_speaker=None
+        audio_uri,
+        *,
+        context,
+        filename,
+        content_type,
+        reference_audio=False,
+        allow_single_speaker=None,
+        diarization=None,
+        target_speaker_labels=None,
     ):
         pipeline.recorded["isolations"].append((filename, bool(reference_audio)))
         if reference_audio:
@@ -351,3 +391,109 @@ async def test_a_failed_diarization_does_not_claim_every_speaker_as_the_avatar(
     assert nontarget_calls == ["Two people talking about someone else."]
     # Nothing from that recording was routed through the target-speech path.
     assert len(pipeline.recorded["classified"]) == classified_before
+
+
+@pytest.mark.asyncio
+async def test_a_promoted_reference_upload_is_diarized_exactly_once(pipeline):
+    """One paid diarizer call covers the reference clip, the corpus and the dialogue.
+
+    Before 2026-11-17 the promoted upload was diarized three times: once to cut
+    the reference clip, once to cut the voice-clone track, and once for the
+    dialogue documents.
+    """
+    await _process(pipeline, "Mom.m4a")
+
+    assert pipeline.recorded["diarizer_calls"] == ["Mom.m4a"]
+    # Both isolations cut from the diarization the upload already paid for.
+    assert pipeline.recorded["isolations_that_reused_a_diarization"] == [True, True]
+    # The reused transcript still reached the target-speech path.
+    assert pipeline.recorded["classified"] == ["One. Two."]
+
+
+@pytest.mark.asyncio
+async def test_the_identity_check_names_the_speaker_the_reference_is_cut_from(
+    pipeline, monkeypatch
+):
+    """The speaker named as the avatar is the anchor, not the speaker who talks most."""
+    import src.subgraphs.process_media_graph.utils.target_attribution as attribution_mod
+
+    async def fake_diarize(**_kwargs):
+        pipeline.recorded["diarizer_calls"].append(_kwargs.get("filename"))
+        return {
+            "text": "Welcome to the show. Thank you.",
+            "segments": [
+                {"speaker": "A", "text": "Welcome to the show.", "start": 0.0, "end": 9.0},
+                {"speaker": "B", "text": "Thank you.", "start": 9.0, "end": 11.0},
+            ],
+        }
+
+    async def fake_identify(turns, *, avatar_name):
+        return attribution_mod.AvatarSpeakerIdentification(
+            verdict="identified",
+            avatar_speaker_labels=["B"],
+            confidence="high",
+            evidence_summary="The host addresses speaker B by the avatar name.",
+        )
+
+    async def fake_dialogue(**kwargs):
+        pipeline.recorded["dialogue_segments"] = kwargs["dialogue_payload"]["segments"]
+        return []
+
+    async def no_attribution(turns, **_kwargs):
+        return None
+
+    monkeypatch.setattr(nodes_mod, "transcribe_audio_diarize", fake_diarize)
+    monkeypatch.setattr(attribution_mod, "identify_avatar_speaker_labels", fake_identify)
+    monkeypatch.setattr(attribution_mod, "adjudicate_target_speaker_labels", no_attribution)
+    monkeypatch.setattr(nodes_mod, "process_dialogue_json_to_documents", fake_dialogue)
+
+    await _process(
+        pipeline,
+        "Interview.m4a",
+        config={"configurable": {"assistant_ctx": {"name": "Guest Person", "metadata": {}}}},
+    )
+
+    assert pipeline.recorded["isolation_target_speaker_labels"] == [["B"], ["B"]]
+    target_turns = [
+        turn["text"] for turn in pipeline.recorded["dialogue_segments"] if turn["is_target"]
+    ]
+    # Speaker B talks for 2 seconds against 9 seconds for speaker A, and
+    # speaker B's turn is still the one stored as the avatar's own speech.
+    assert target_turns == ["Thank you."]
+
+
+@pytest.mark.asyncio
+async def test_a_recording_the_avatar_does_not_speak_in_stores_no_reference(
+    pipeline, monkeypatch
+):
+    import src.subgraphs.process_media_graph.utils.target_attribution as attribution_mod
+
+    async def fake_identify(turns, *, avatar_name):
+        return attribution_mod.AvatarSpeakerIdentification(
+            verdict="absent",
+            avatar_speaker_labels=[],
+            confidence="high",
+            evidence_summary="Both speakers discuss the avatar in the third person.",
+        )
+
+    async def fake_nontarget(**kwargs):
+        return []
+
+    monkeypatch.setattr(attribution_mod, "identify_avatar_speaker_labels", fake_identify)
+    monkeypatch.setattr(
+        nodes_mod, "process_nontarget_text_to_identity_documents", fake_nontarget
+    )
+
+    await _process(
+        pipeline,
+        "Commentary.m4a",
+        config={"configurable": {"assistant_ctx": {"name": "Guest Person", "metadata": {}}}},
+    )
+
+    assert (
+        await reference_audio.read_reference_audio(pipeline.store, USER_ID, ASSISTANT_ID)
+        is None
+    )
+    # No clip was cut, and the recording was still diarized only once.
+    assert pipeline.recorded["isolations"] == []
+    assert pipeline.recorded["diarizer_calls"] == ["Commentary.m4a"]

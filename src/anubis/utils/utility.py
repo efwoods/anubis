@@ -1646,6 +1646,7 @@ def _merge_diarized_segments_from_chunks(
     chunk_responses: list[TranscriptionDiarized],
     time_offsets: list[float],
     known_speaker_label: Optional[str] = None,
+    namespace_every_label: bool = False,
 ) -> list[dict]:
     """Flatten chunked diarization responses onto the original timeline.
 
@@ -1665,6 +1666,12 @@ def _merge_diarized_segments_from_chunks(
     is None (no reference audio, including the create-reference-media-from-
     playlist path where every speaker is treated as the target), labels are
     kept verbatim as before.
+
+    ``namespace_every_label`` namespaces EVERY label with the chunk index when
+    no reference audio exists. The promoted reference upload passes ``True``:
+    with verbatim labels, ``speaker_0`` of chunk 0 and ``speaker_0`` of chunk 1
+    can be two different people, and summing the talk time of both people
+    under one label picked the wrong dominant speaker.
     """
     normalized_known_label = (
         known_speaker_label.strip().lower()
@@ -1676,7 +1683,7 @@ def _merge_diarized_segments_from_chunks(
         for seg in resp.segments:
             sd = seg.model_dump()
             raw_label = str(sd.get("speaker") or "unknown")
-            if (
+            if namespace_every_label or (
                 normalized_known_label is not None
                 and raw_label.strip().lower() != normalized_known_label
             ):
@@ -1759,16 +1766,12 @@ async def transcribe_video(
     )
 
 
-# TODO: when chunking, the total tokens, and input and output tokens should be calculated and returned in the response (aggregated from all chunks)
-
-# TODO: when diarizing The model cost needs to be calculated and returned in the response (using total aggregated tokens from all chunks for input and output tokens)
-
-
 def _select_dominant_speaker_segments(
     diarized_segments: list,
     *,
     short_fallback_s: float = 1.0,
     allow_single_speaker: bool = False,
+    target_speaker_labels: Optional[list[str]] = None,
 ) -> Optional[tuple[str, list[dict], dict[str, float], float]]:
     """Pure selection logic: filter text-bearing segments, pick the speaker
     with the largest total speech time, return that speaker's segments.
@@ -1785,6 +1788,12 @@ def _select_dominant_speaker_segments(
     is the target talking alone, so a single speaker is the desired case and
     must still yield that speaker's segments (and therefore a transcript) rather
     than falling through to the empty-text passthrough.
+
+    ``target_speaker_labels`` names the speaker labels already identified as
+    the avatar (the reference identity check). When ``target_speaker_labels``
+    is given, the segments under those labels are returned instead of the
+    segments of the speaker with the most talk time, so an interviewer who
+    talks more than the avatar is never selected.
     """
     speech_segs: list[dict] = []
     for seg in diarized_segments:
@@ -1822,6 +1831,15 @@ def _select_dominant_speaker_segments(
     # audio a single speaker is the expected, desired case, so keep that speaker
     # rather than bailing — otherwise the reference document is stored with an
     # empty transcript.
+    if target_speaker_labels:
+        chosen_labels = {str(label) for label in target_speaker_labels}
+        chosen_segments = [s for s in speech_segs if s["speaker"] in chosen_labels]
+        chosen_total = sum(s["end"] - s["start"] for s in chosen_segments)
+        if not chosen_segments or chosen_total < short_fallback_s:
+            return None
+        first_chosen_label = chosen_segments[0]["speaker"]
+        return first_chosen_label, chosen_segments, totals, chosen_total
+
     if len(totals) <= 1 and not allow_single_speaker:
         return None
 
@@ -1845,9 +1863,25 @@ async def isolate_dominant_speaker_audio_b64(
     content_type: Optional[str] = None,
     reference_audio: Optional[bool] = False,
     allow_single_speaker: Optional[bool] = None,
+    diarization: Optional[dict] = None,
+    target_speaker_labels: Optional[list[str]] = None,
 ) -> dict:
     """Diarize input audio, pick the dominant speech-bearing speaker, and
     return a coherent triple describing the produced clip.
+
+    ``diarization`` is a ``transcribe_audio_diarize`` response for this same
+    audio. When ``diarization`` is given, no diarizer call is made: the clip is
+    cut from the segments of ``diarization``. A promoted reference upload is
+    diarized once and the one response is reused for the reference clip, the
+    voice-clone track and the dialogue documents.
+
+    ``target_speaker_labels`` names the labels already identified as the
+    avatar; see ``_select_dominant_speaker_segments``.
+
+    The returned dictionary also carries ``diarization_response``: the
+    diarizer response this call paid for (``None`` when ``diarization`` was
+    supplied or when the diarizer call failed), so every caller can record the
+    cost of the diarizer call with ``persist_api_metrics_row``.
 
     ``allow_single_speaker`` decides what a recording with only one speaker
     yields. ``None`` (the default) keeps the historical rule: a reference clip
@@ -1897,11 +1931,24 @@ async def isolate_dominant_speaker_audio_b64(
     short_fallback_s = 1.0
     fade_s = 0.025
 
+    paid_diarization_response: Optional[dict] = None
+
+    def _billing_view(diarization_response: Optional[dict]) -> Optional[dict]:
+        """The diarizer response without the encoded audio payload."""
+        if not diarization_response:
+            return None
+        return {
+            key: value
+            for key, value in diarization_response.items()
+            if key != "encoded_audio_base64"
+        }
+
     def _fallback() -> dict:
         return {
             "audio_base64_preprocessed": audio_base64,
             "duration": None,
             "text": "",
+            "diarization_response": _billing_view(paid_diarization_response),
         }
 
     work_path: Optional[str] = None
@@ -1923,21 +1970,25 @@ async def isolate_dominant_speaker_audio_b64(
             tmp.write(raw)
             work_path = tmp.name
 
-        try:
-            diar = await transcribe_audio_diarize(
-                media_base64=audio_base64,
-                context=context,
-                encoded_reference_audio=None,
-                filename=filename,
-                content_type=content_type,
-                reference_audio=reference_audio,
-            )
-        except Exception as exc:
-            logger.warning(
-                "isolate_dominant_speaker_audio_b64: diarization failed (%s); returning fallback",
-                exc,
-            )
-            return _fallback()
+        if diarization is not None:
+            diar = diarization
+        else:
+            try:
+                diar = await transcribe_audio_diarize(
+                    media_base64=audio_base64,
+                    context=context,
+                    encoded_reference_audio=None,
+                    filename=filename,
+                    content_type=content_type,
+                    reference_audio=reference_audio,
+                )
+                paid_diarization_response = diar
+            except Exception as exc:
+                logger.warning(
+                    "isolate_dominant_speaker_audio_b64: diarization failed (%s); returning fallback",
+                    exc,
+                )
+                return _fallback()
 
         selection = _select_dominant_speaker_segments(
             (diar or {}).get("segments") or [],
@@ -1947,6 +1998,7 @@ async def isolate_dominant_speaker_audio_b64(
                 if allow_single_speaker is None
                 else bool(allow_single_speaker)
             ),
+            target_speaker_labels=target_speaker_labels,
         )
         if selection is None:
             logger.info(
@@ -2077,6 +2129,7 @@ async def isolate_dominant_speaker_audio_b64(
                 "audio_base64_preprocessed": final_audio_b64,
                 "duration": clip_duration,
                 "text": clip_content,
+                "diarization_response": _billing_view(paid_diarization_response),
             }
 
         return await asyncio.to_thread(_produce_clip)
@@ -2097,16 +2150,20 @@ async def transcribe_audio_diarize(
     filename: Optional[str] = None,
     content_type: Optional[str] = None,
     reference_audio: Optional[bool] = False,
+    namespace_chunk_labels_without_reference: bool = False,
 ) -> dict:
-    """Diarize video or audio from base64 (chunked when audio exceeds whisper_max_bytes)."""
+    """Diarize video or audio from base64 (chunked when audio exceeds whisper_max_bytes).
+
+    ``namespace_chunk_labels_without_reference`` prefixes every speaker label
+    with the chunk index when the audio is chunked and no reference audio is
+    supplied; see ``_merge_diarized_segments_from_chunks``.
+    """
     start_time = time_ns()
     client = _openai_client_for_speech(context)
 
     orig_name = filename or "upload.mp4"
     suffix = Path(orig_name).suffix or ".mp4"
     is_audio = _upload_is_audio_for_diarize(filename, content_type)
-
-    # asdf
 
     source_path = None
     audio_path = None
@@ -2162,6 +2219,24 @@ async def transcribe_audio_diarize(
 
     ##### Diarize content using reference audio
     try:
+        from src.anubis.utils.speech.diarization_providers import (
+            PROVIDER_OPENAI,
+            diarize_mp3_with_hosted_provider,
+            selected_diarization_provider,
+        )
+
+        diarization_provider = selected_diarization_provider(context)
+        if diarization_provider != PROVIDER_OPENAI:
+            # A hosted diarizer takes the whole recording in one request, so
+            # the recording is not cut into chunks and no reference clip is
+            # sent; the avatar's turns are identified afterwards from the
+            # transcript (``target_attribution.py``).
+            hosted_response = await diarize_mp3_with_hosted_provider(
+                diarization_provider, audio_path, context
+            )
+            hosted_response["encoded_audio_base64"] = preprocessed_audio["audio_base64"]
+            return hosted_response
+
         size_bytes = len(raw)
         diarize_upload_name = (
             Path(orig_name).stem + ".mp3"  # Preprocessed audio codec
@@ -2274,6 +2349,10 @@ async def transcribe_audio_diarize(
                     context.audio_diarization_known_speaker_name
                     if encoded_reference_audio
                     else None
+                ),
+                namespace_every_label=(
+                    namespace_chunk_labels_without_reference
+                    and not encoded_reference_audio
                 ),
             )
             response_dict = {

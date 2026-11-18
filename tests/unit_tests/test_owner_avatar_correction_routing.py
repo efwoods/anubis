@@ -403,6 +403,86 @@ async def test_edit_rewrites_the_wrong_claim_inside_a_shared_biography(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_one_biography_sentence_gets_one_suggestion_across_every_fact(monkeypatch):
+    """Production 2026-10-30: one suggestion call per fact turned one biography sentence
+    into five different sentences across eight facts, and six facts kept a stale clause."""
+    store = _make_store()
+    fact_keys = [
+        await _seed_biography_fact(store, f"I am working on startup task number {i}.")
+        for i in range(3)
+    ]
+    suggestion_call_count = 0
+
+    async def _varying_suggestion(match, **kwargs):
+        nonlocal suggestion_call_count
+        suggestion_call_count += 1
+        return (f"Stylometric wording {suggestion_call_count}.", "", True)
+
+    captured_payload: dict = {}
+    monkeypatch.setattr(identity_tools, "_suggest_correction", _varying_suggestion)
+    monkeypatch.setattr(identity_tools, "interrupt", _accept_every_match(captured_payload))
+
+    await edit_identity_fact.coroutine(
+        inaccurate_information=BIOGRAPHY_ROUGE_SENTENCE,
+        corrected_information="Creating proof with stylometric indicators.",
+        correction_context="",
+        runtime=_FakeRuntime(store, latest_user_message=ROUGE_CORRECTION_MESSAGE),
+    )
+
+    assert suggestion_call_count == 1
+    previews = captured_payload["payload"]["matches"]
+    assert len({preview["shared_sentence_group"] for preview in previews}) == 1
+    assert {preview["shared_sentence_document_count"] for preview in previews} == {3}
+    for key in fact_keys:
+        document = await _stored_document(store, IDENTITY_MEMORY_NAMESPACE, key)
+        assert "Stylometric wording 1." in document.metadata["fact_context"]
+        assert BIOGRAPHY_ROUGE_SENTENCE not in document.page_content
+
+
+@pytest.mark.asyncio
+async def test_owner_rewrite_on_one_card_reaches_every_copy_of_the_sentence(monkeypatch):
+    store = _make_store()
+    fact_keys = [
+        await _seed_biography_fact(store, f"I am working on startup task number {i}.")
+        for i in range(2)
+    ]
+    owner_sentence = "Creating proof with moving average type-token ratio."
+
+    def _owner_edits_first_card_only(payload):
+        return {
+            "type": "apply",
+            "items": [
+                {
+                    "index": match["index"],
+                    "action": "accept",
+                    **({"corrected_text": owner_sentence} if match["index"] == 0 else {}),
+                }
+                for match in payload["matches"]
+            ],
+        }
+
+    monkeypatch.setattr(identity_tools, "interrupt", _owner_edits_first_card_only)
+
+    await edit_identity_fact.coroutine(
+        inaccurate_information=BIOGRAPHY_ROUGE_SENTENCE,
+        corrected_information="Creating proof with stylometric indicators.",
+        correction_context="",
+        runtime=_FakeRuntime(store, latest_user_message=ROUGE_CORRECTION_MESSAGE),
+    )
+
+    for key in fact_keys:
+        document = await _stored_document(store, IDENTITY_MEMORY_NAMESPACE, key)
+        assert owner_sentence in document.metadata["fact_context"]
+        assert owner_sentence in document.page_content
+
+
+def test_suggestion_prompt_forbids_stale_clauses_and_named_rejections():
+    prompt_text = identity_tools._CORRECTION_SUGGESTION_SYSTEM_PROMPT
+    assert "must not keep any clause" in prompt_text
+    assert "without naming the rejected detail" in prompt_text
+
+
+@pytest.mark.asyncio
 async def test_text_restating_the_url_correction_is_replaced_by_the_corrected_fact(monkeypatch):
     """Production row 4a0745f2 said "…evanfwoods, not linkedin.com/in/evanwoods."; the
     per-match model swapped the wrong side, so the text is replaced by the corrected fact."""

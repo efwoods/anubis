@@ -533,6 +533,41 @@ async def _observe_user_in_background(
         logger.warning("observe_user: emotional state failed: %s", emotion_error)
 
 
+async def _apply_names_stated_in_latest_message(
+    store: object, user_id: str | None, assistant_id: str | None, latest_message: object
+) -> tuple[list[str], str | None]:
+    """Apply every name the user states or rejects in the latest message.
+
+    Returns the rejected names and the newly stated name. Only the user's own
+    typed or spoken words count: a hidden ambient observation and a spoken turn
+    in which another person spoke are skipped, because a name stated by another
+    voice in the room is not the user's name. A failure never fails the turn.
+    """
+    try:
+        if not isinstance(latest_message, HumanMessage) or not user_id or not assistant_id:
+            return [], None
+        additional_kwargs = getattr(latest_message, "additional_kwargs", None) or {}
+        if additional_kwargs.get("hidden") or additional_kwargs.get("kind") == "ambient_observation":
+            return [], None
+        if (additional_kwargs.get("speakers") or {}).get("others_spoke"):
+            return [], None
+        from src.anubis.utils.learning.address_correction import (
+            apply_names_stated_in_message,
+            extract_rejected_address_names,
+            extract_stated_user_name,
+        )
+
+        latest_text = message_text(latest_message.content)
+        if not extract_rejected_address_names(latest_text) and not extract_stated_user_name(
+            latest_text
+        ):
+            return [], None
+        return await apply_names_stated_in_message(store, user_id, assistant_id, latest_text)
+    except Exception as name_error:  # noqa: BLE001 - a name update must never fail a turn
+        logger.warning("Applying the names stated in the latest message failed: %s", name_error)
+        return [], None
+
+
 async def observe_user(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):
@@ -792,6 +827,16 @@ async def _build_consciousness_system_message_update(
 
     creator_id = config["configurable"]["assistant_ctx"]["metadata"]["user_id"]
 
+    # A name change in the latest message ("do not call me David", "my name is
+    # Sam") is applied to the store BEFORE the lookups below, so the prompt built
+    # for this very turn already carries the current name and no rejected name.
+    # The check is a regular expression over the user's own words (no model
+    # call), and the store is touched only when the latest message states or
+    # rejects a name.
+    await _apply_names_stated_in_latest_message(
+        runtime.store, user_id, assistant_id, state["messages"][-1]
+    )
+
     user_identity_namespace = (assistant_id, user_id, "identity")
     assistant_identity_namespace = (creator_id, assistant_id, "identity")
     assistant_identity_memory_namespace = (
@@ -996,8 +1041,19 @@ async def _build_consciousness_system_message_update(
     # STATEFUL: merge the docs persisted in graph state with this turn's retrieval,
     # de-duplicated by stable id (the fresh store copy wins, so edits are reflected).
     # Identity channels are never salience-pruned — the avatar must not forget identity.
+    # Facts about the user are mutable: a fact the user replaced or rejected is
+    # deleted from the store, in this conversation or in another conversation.
+    # Thread state would otherwise carry the deleted fact forever, so the prior
+    # documents are first reconciled with the store by document id.
+    from src.anubis.utils.learning.user_fact_relearning import (
+        reconcile_documents_with_store,
+    )
+
+    prior_user_identity_documents = await reconcile_documents_with_store(
+        runtime.store, user_identity_namespace, state.get("user_identity_documents")
+    )
     user_identity = await merge_dedup_threshold_documents(
-        state.get("user_identity_documents"),
+        prior_user_identity_documents,
         user_identity_document_items,
         query,
         apply_threshold=False,
@@ -1277,6 +1333,7 @@ async def _build_consciousness_system_message_update(
         conversation_sentiment_history=learning_sections.conversation_sentiment_history,
         what_feels_real=learning_sections.what_feels_real,
         user_preferences=learning_sections.user_preferences,
+        user_address_preferences=learning_sections.user_address_preferences,
     )
 
     if getattr(runtime.context, "debug_system_prompt", None) == "TRUE":

@@ -514,6 +514,129 @@ def coalesce_segments_by_speaker(
     return turns
 
 
+DEFAULT_DIARIZATION_FRAGMENT_MAXIMUM_SECONDS = 1.0
+DEFAULT_DIARIZATION_FRAGMENT_MAXIMUM_GAP_SECONDS = 0.5
+
+
+def _segment_time_bounds(segment: Dict[str, Any]) -> Optional[tuple[float, float]]:
+    """Return ``(start, end)`` in seconds, or ``None`` when either bound is missing."""
+    try:
+        return float(segment.get("start")), float(segment.get("end"))
+    except (TypeError, ValueError):
+        return None
+
+
+def merge_interleaved_fragments(
+    segments: List[Dict[str, Any]],
+    *,
+    fragment_maximum_seconds: float = DEFAULT_DIARIZATION_FRAGMENT_MAXIMUM_SECONDS,
+    maximum_gap_seconds: float = DEFAULT_DIARIZATION_FRAGMENT_MAXIMUM_GAP_SECONDS,
+) -> List[Dict[str, Any]]:
+    """Regroup overlapping speech so each speaker's sentence stays in one piece.
+
+    When two people talk over each other, a diarizer cuts both sentences into
+    sub-second pieces and emits the pieces alternately ("see that moon in" /
+    "I" / "the bottom of" / "can keep" / "it that's" / "this?").
+    ``coalesce_segments_by_speaker`` merges only consecutive same-speaker
+    segments, so every piece became a separate turn and a separate one-word
+    quote document.
+
+    A fragment run is a maximal sequence of consecutive segments, each shorter
+    than ``fragment_maximum_seconds``, separated by at most
+    ``maximum_gap_seconds``, and spoken by two or more speakers. Inside a
+    fragment run the segments are regrouped per speaker, keeping each speaker's
+    word order. The speaker of the segment before the fragment run is emitted
+    first and the speaker of the segment after the fragment run is emitted last,
+    so ``coalesce_segments_by_speaker`` then joins each regrouped sentence to
+    the surrounding turn of the same speaker.
+
+    Segments outside a fragment run, and segments with no usable timestamps,
+    are returned unchanged and in the original order. The function is pure and
+    never drops text.
+    """
+    usable_segments = [
+        segment
+        for segment in segments
+        if isinstance(segment, dict) and (segment.get("text") or "").strip()
+    ]
+
+    def _is_fragment(segment: Dict[str, Any]) -> bool:
+        bounds = _segment_time_bounds(segment)
+        if bounds is None:
+            return False
+        return (bounds[1] - bounds[0]) < fragment_maximum_seconds
+
+    def _speaker_of(segment: Dict[str, Any]) -> str:
+        return str(segment.get("speaker") or "unknown")
+
+    merged_segments: List[Dict[str, Any]] = []
+    index = 0
+    while index < len(usable_segments):
+        segment = usable_segments[index]
+        if not _is_fragment(segment):
+            merged_segments.append(segment)
+            index += 1
+            continue
+
+        run_end = index + 1
+        while run_end < len(usable_segments) and _is_fragment(usable_segments[run_end]):
+            previous_bounds = _segment_time_bounds(usable_segments[run_end - 1])
+            next_bounds = _segment_time_bounds(usable_segments[run_end])
+            if (next_bounds[0] - previous_bounds[1]) > maximum_gap_seconds:
+                break
+            run_end += 1
+        fragment_run = usable_segments[index:run_end]
+
+        speakers_in_order: List[str] = []
+        for fragment in fragment_run:
+            if _speaker_of(fragment) not in speakers_in_order:
+                speakers_in_order.append(_speaker_of(fragment))
+        if len(speakers_in_order) < 2:
+            merged_segments.extend(fragment_run)
+            index = run_end
+            continue
+
+        speaker_before_run = (
+            _speaker_of(merged_segments[-1]) if merged_segments else None
+        )
+        speaker_after_run = (
+            _speaker_of(usable_segments[run_end])
+            if run_end < len(usable_segments)
+            else None
+        )
+        emission_order = list(speakers_in_order)
+        if speaker_before_run in emission_order:
+            emission_order.remove(speaker_before_run)
+            emission_order.insert(0, speaker_before_run)
+        if (
+            speaker_after_run in emission_order
+            and speaker_after_run != speaker_before_run
+        ):
+            emission_order.remove(speaker_after_run)
+            emission_order.append(speaker_after_run)
+
+        for speaker in emission_order:
+            speaker_fragments = [
+                fragment for fragment in fragment_run if _speaker_of(fragment) == speaker
+            ]
+            regrouped_segment = dict(speaker_fragments[0])
+            regrouped_segment["text"] = " ".join(
+                (fragment.get("text") or "").strip() for fragment in speaker_fragments
+            )
+            regrouped_segment["start"] = min(
+                _segment_time_bounds(fragment)[0] for fragment in speaker_fragments
+            )
+            regrouped_segment["end"] = max(
+                _segment_time_bounds(fragment)[1] for fragment in speaker_fragments
+            )
+            regrouped_segment["is_target"] = any(
+                bool(fragment.get("is_target")) for fragment in speaker_fragments
+            )
+            merged_segments.append(regrouped_segment)
+        index = run_end
+    return merged_segments
+
+
 def _build_target_quote_documents_from_dialogue(
     dialogue_segments: List[Dict[str, Any]],
     *,
@@ -728,14 +851,24 @@ def _build_adapter_dialogue_document(
     )
 
 
-def _format_dialogue_transcript(segments: List[Dict[str, Any]]) -> str:
-    """Render coalesced turns as ``speaker: text`` lines for whole-scene summary."""
+def _format_dialogue_transcript(
+    segments: List[Dict[str, Any]], *, target_name: Optional[str] = None
+) -> str:
+    """Render coalesced turns as ``speaker: text`` lines for whole-scene summary.
+
+    The target's turns carry the diarizer's known-speaker label (``avatar``),
+    which is not a person's name. When ``target_name`` is given, the target's
+    turns are rendered under ``target_name`` so the scene summary names the
+    avatar instead of treating "avatar" as a person.
+    """
     lines: List[str] = []
     for seg in segments:
         text = (seg.get("text") or "").strip()
         if not text:
             continue
         speaker = str(seg.get("speaker") or "unknown")
+        if target_name and seg.get("is_target"):
+            speaker = target_name
         lines.append(f"{speaker}: {text}")
     return "\n".join(lines)
 
@@ -958,7 +1091,8 @@ async def process_dialogue_json_to_documents(
     # Spec Step 1: summarize the entire scene ONCE so each target statement can
     # be analyzed with the overall situation as situational context.
     scene_summary = await generate_scene_summary(
-        _format_dialogue_transcript(segments), target_name=target_name
+        _format_dialogue_transcript(segments, target_name=target_name),
+        target_name=target_name,
     )
 
     # Target turns under ``quote`` (verbatim), each carrying its preceding

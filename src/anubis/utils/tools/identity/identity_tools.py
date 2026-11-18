@@ -20,6 +20,7 @@ from src.anubis.utils.utility import extract_user_id_assistant_id
 
 logger = logging.getLogger(__name__)
 
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
@@ -1572,6 +1573,20 @@ class UserFactAndContext(BaseModel):
             description="A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message."
         ),
     ]
+    replaces_user_facts: Annotated[
+        list[str],
+        Field(
+            default_factory=list,
+            description="Every fact about the user ALREADY listed in CURRENT USER that user_fact makes outdated or wrong, copied exactly from the <FACT> text (for example ['I live in Boston.'] when the user says the user moved to Denver). Each listed fact is deleted and user_fact takes the place of the deleted fact. Leave empty when user_fact is new information that contradicts nothing.",
+        ),
+    ]
+    rejected_user_names: Annotated[
+        list[str],
+        Field(
+            default_factory=list,
+            description="Every name the user said NOT to call the user (for example ['David'] for 'do not call me David'). Each rejected name is removed from memory. Never write a rejected name inside user_fact.",
+        ),
+    ]
 
 
 @tool(
@@ -1592,10 +1607,30 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
             description="A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message."
         ),
     ],
+    replaces_user_facts: Annotated[
+        list[str] | None,
+        Field(
+            description="Every fact about the user ALREADY listed in CURRENT USER that user_fact makes outdated or wrong, copied exactly from the <FACT> text (for example ['I live in Boston.'] when the user says the user moved to Denver). Each listed fact is deleted and user_fact takes the place of the deleted fact. Leave empty when user_fact is new information that contradicts nothing."
+        ),
+    ] = None,
+    rejected_user_names: Annotated[
+        list[str] | None,
+        Field(
+            description="Every name the user said NOT to call the user (for example ['David'] for 'do not call me David'). Each rejected name is removed from memory. Never write a rejected name inside user_fact."
+        ),
+    ] = None,
     # Hide these arguments from the model.
     runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
 ) -> GlobalState:
     """
+    <RELEARNING>
+    A fact about the user can change any number of times. When the user says something that
+    makes a fact in CURRENT USER outdated or wrong ("I moved to Denver", "I quit that job",
+    "actually my sister's name is Ana"), pass the new fact as user_fact and list every
+    outdated CURRENT USER fact, copied exactly, in replaces_user_facts. The outdated fact is
+    deleted and the new fact takes the place of the outdated fact.
+    </RELEARNING>
+
     <INSTRUCTIONS>
 
     Learn facts about the USER (the person you are speaking with) that they share
@@ -1746,6 +1781,117 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
     """
     logger.info(f"breakpoint")
 
+    # A name the user rejects for the user ("my name is Evan, do not call me
+    # David") is removed from the store, and a fact that repeats the rejected name
+    # ("My name isn't David.") is never stored: a stored sentence that says "not
+    # David" teaches the name David (avatar 47cfdaa2, 2026-11-18). The rejected
+    # names come from the tool argument and from the user's own latest message.
+    from src.anubis.utils.learning.address_correction import (
+        extract_preferred_address_name,
+        extract_rejected_address_names,
+        fact_names_user_with_rejected_name,
+        purge_rejected_address_name,
+    )
+
+    latest_user_message_text_for_names = _latest_user_message_text(
+        (runtime.state or {}).get("messages")
+    )
+    all_rejected_user_names: list[str] = []
+    for rejected_user_name in [
+        *(rejected_user_names or []),
+        *extract_rejected_address_names(latest_user_message_text_for_names),
+    ]:
+        rejected_user_name = (rejected_user_name or "").strip()
+        if rejected_user_name and rejected_user_name.lower() not in {
+            existing.lower() for existing in all_rejected_user_names
+        }:
+            all_rejected_user_names.append(rejected_user_name)
+    if all_rejected_user_names:
+        (
+            name_purge_user_state,
+            name_purge_assistant_state,
+        ) = await extract_user_id_assistant_id(runtime.config)
+        wanted_user_name = extract_preferred_address_name(
+            latest_user_message_text_for_names
+        ) or extract_preferred_address_name(user_fact)
+        for rejected_user_name in all_rejected_user_names:
+            await purge_rejected_address_name(
+                runtime.store,
+                name_purge_user_state.get("user_id"),
+                name_purge_assistant_state.get("assistant_id"),
+                rejected_name=rejected_user_name,
+                correct_name=wanted_user_name,
+            )
+        if any(
+            fact_names_user_with_rejected_name(user_fact, rejected_user_name)
+            for rejected_user_name in all_rejected_user_names
+        ):
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content=(
+                                "Learned: the rejected name was removed from memory"
+                                + (
+                                    f" and the user is addressed as {wanted_user_name}."
+                                    if wanted_user_name
+                                    else "."
+                                )
+                                + " Never say the rejected name again, including in "
+                                "the acknowledgement."
+                            ),
+                            tool_call_id=runtime.tool_call_id,
+                        )
+                    ]
+                }
+            )
+
+    # A fact about the user is mutable without limit: the user moves, changes
+    # jobs, changes a name, changes a mind. The stored facts the new fact replaces
+    # are deleted first, so the store holds the current statement only. The match
+    # is by exact text, never by similarity, so a replacement cannot delete an
+    # unrelated fact.
+    replaced_fact_note = ""
+    if replaces_user_facts:
+        from src.anubis.utils.learning.user_fact_relearning import replace_user_facts
+
+        (
+            replacement_user_state,
+            replacement_assistant_state,
+        ) = await extract_user_id_assistant_id(runtime.config)
+        deleted_facts, unmatched_texts, nearest_stored_facts = await replace_user_facts(
+            runtime.store,
+            (
+                replacement_assistant_state.get("assistant_id"),
+                replacement_user_state.get("user_id"),
+                "identity",
+            ),
+            [text for text in replaces_user_facts if text != user_fact],
+        )
+        if deleted_facts:
+            replaced_fact_note += " Replaced the stored fact: " + " | ".join(deleted_facts)
+        if unmatched_texts:
+            replaced_fact_note += (
+                " No stored fact has exactly the text: "
+                + " | ".join(unmatched_texts)
+                + ". The nearest stored facts are: "
+                + (" | ".join(nearest_stored_facts) or "(none)")
+                + ". When one of the nearest stored facts is the outdated fact, call "
+                "learn_information_about_the_user again with the same user_fact and "
+                "replaces_user_facts set to the exact stored text."
+            )
+        # The thread carries the deleted fact in graph state until the prompt is
+        # rebuilt; drop the deleted fact here so the duplicate check below does
+        # not read the deleted fact as still known.
+        deleted_normalized = {fact.strip().lower() for fact in deleted_facts}
+        if deleted_normalized and runtime.state is not None:
+            runtime.state["user_identity_documents"] = [
+                document
+                for document in (runtime.state.get("user_identity_documents") or [])
+                if str((document.metadata or {}).get("fact") or "").strip().lower()
+                not in deleted_normalized
+            ]
+
     if fact_is_about_the_avatar(user_fact):
         # Refuse before touching the store and name the avatar tool, so the
         # model re-files the fact under the avatar in the first person.
@@ -1839,14 +1985,45 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
         update = {
             "messages": [
                 ToolMessage(
-                    content=f"Fact: {user_fact} previously learned",
+                    content=f"Fact: {user_fact} previously learned.{replaced_fact_note}",
                     tool_call_id=tool_call_id,
                 )
             ]
         }
         return Command(update=update)
 
-    # model_with_structured_output = init_model(context = runtime.context, response_format=UserFactAndContext)
+    # The new fact is not a duplicate. A stored fact the new fact makes outdated
+    # ("I live in Denver now." after "I live in Boston.") is deleted, so the user
+    # can relearn any fact any number of times without the model having to name
+    # the outdated fact in ``replaces_user_facts``. Only the nearest stored facts
+    # are compared, and only a stored fact returned verbatim is deleted.
+    from src.anubis.utils.learning.user_fact_relearning import (
+        find_outdated_user_facts,
+        replace_user_facts,
+    )
+
+    nearest_stored_user_facts = [
+        stored_fact
+        for stored_fact in (
+            str(((getattr(item, "value", None) or {}).get("document") or {})
+                .get("kwargs", {})
+                .get("metadata", {})
+                .get("fact") or "")
+            for item in (user_content_store_query_results or [])
+        )
+        if stored_fact
+    ]
+    outdated_stored_user_facts = await find_outdated_user_facts(
+        user_fact, nearest_stored_user_facts
+    )
+    if outdated_stored_user_facts:
+        automatically_deleted_facts, _unmatched, _nearest = await replace_user_facts(
+            runtime.store, user_identity_namespace, outdated_stored_user_facts
+        )
+        if automatically_deleted_facts:
+            replaced_fact_note += " Replaced the outdated stored fact: " + " | ".join(
+                automatically_deleted_facts
+            )
 
     identity_id = str(uuid.uuid4())
 
@@ -1875,7 +2052,7 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
             update={
                 "messages": [
                     ToolMessage(
-                        content=f"Fact: {user_fact} previously learned",
+                        content=f"Fact: {user_fact} previously learned.{replaced_fact_note}",
                         tool_call_id=tool_call_id,
                     )
                 ]
@@ -1909,7 +2086,7 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
         "user_identity_documents": [user_identity_document],
         "messages": [
             ToolMessage(
-                content=f"Learned about the user: {user_fact}",
+                content=f"Learned about the user: {user_fact}{replaced_fact_note}",
                 tool_call_id=tool_call_id,
             )
         ],
@@ -2173,8 +2350,9 @@ class ProposedFactEdit(BaseModel):
     The correction tool finds many stored texts that match the inaccurate claim; each one
     is a different sentence in a different document, so a single global replacement would
     flatten unrelated facts (see the failure cases in ``features/.../fp_correction``). This
-    model is generated PER MATCH so only the offending span is changed and everything else
-    in that specific text is preserved verbatim.
+    model is generated once per distinct matched text, so only the offending span is changed
+    and everything else in the matched text is preserved verbatim. A sentence stored in many
+    documents shares one generated edit (see ``_suggest_once_per_shared_sentence``).
     """
 
     asserts_inaccurate_fact: bool = Field(
@@ -2246,12 +2424,116 @@ rewrite that portion so the context records the correction instead, drawing on \
 USER_CORRECTION_CONTEXT. A context is NOT "still true" merely because the outdated statement \
 was once said: the stored context grounds the fact for future recall, so the returned \
 `corrected_context` must never state, attribute, or imply the inaccurate fact.
+- `corrected_text` must not keep any clause, qualifier, or trailing phrase of the inaccurate statement. When the correction replaces how something is done, the corrected sentence states only the replacement and drops every clause that described the inaccurate method (for example, a stored sentence "using metrics such as A and B to measure similarity as well as C with the aim of D" corrected to "using E" becomes "using E", with no "as well as C" and no "with the aim of D" left over unless USER_CORRECTION keeps C or D).
+- `corrected_text` and `corrected_context` must state what is true without naming the rejected detail. Do not write "not A", "rather than A", or "instead of A" for a rejected detail A, even when USER_CORRECTION contains that negation: the stored text is placed in the avatar's prompt, and a rejected detail named in the prompt is repeated by the avatar. A negation is kept only for a `delete` whose true content is itself the absence of something (for example "I do not have a favorite color").
 """
 
 
 # Per-match suggestion calls fan out concurrently; bound them so a correction touching many
 # documents does not open dozens of simultaneous model calls.
 _SUGGESTION_CONCURRENCY = asyncio.Semaphore(8)
+
+
+# Match kinds whose edit is only a replacement of ``matched_text``. One pasted biography can
+# be the ``fact_context`` of many facts, so the same sentence is matched once per fact. These
+# kinds never apply ``corrected_context``, which keeps the suggestion document-independent.
+_SHARED_SENTENCE_MATCH_KINDS = ("sentence", "context_sentence")
+
+
+def _shared_sentence_key(match: FactMatch) -> str | None:
+    """Return the sentence identity that groups ``match`` with identical sentences.
+
+    Atomic facts and source links return None: each of those matches keeps a suggestion of
+    the match's own, because the edit rewrites per-document text beyond ``matched_text``.
+    """
+    if match.kind not in _SHARED_SENTENCE_MATCH_KINDS:
+        return None
+    return " ".join((match.matched_text or "").split()).casefold() or None
+
+
+async def _suggest_once_per_shared_sentence(
+    matches: list[FactMatch],
+    suggest_for_match: Callable[[FactMatch], Awaitable[tuple[str, str, bool]]],
+) -> list[tuple[str, str, bool]]:
+    """Suggest one edit per distinct sentence, then give every match of a sentence that edit.
+
+    Regression for avatar 47cfdaa2 (production, 2026-10-30): one suggestion call per match
+    rewrote one biography sentence, stored in eight facts, into five different sentences. Six
+    of the eight facts kept a clause of the inaccurate sentence, and the avatar repeated that
+    clause. A sentence held by many documents must come out identical in every document.
+    """
+    pending_matches: list[FactMatch] = []
+    pending_position_by_sentence: dict[str, int] = {}
+    pending_position_by_match_position: list[int] = []
+    for match in matches:
+        sentence_key = _shared_sentence_key(match)
+        if sentence_key is not None and sentence_key in pending_position_by_sentence:
+            pending_position_by_match_position.append(
+                pending_position_by_sentence[sentence_key]
+            )
+            continue
+        pending_position = len(pending_matches)
+        pending_matches.append(match)
+        pending_position_by_match_position.append(pending_position)
+        if sentence_key is not None:
+            pending_position_by_sentence[sentence_key] = pending_position
+    pending_suggestions = await asyncio.gather(
+        *(suggest_for_match(match) for match in pending_matches)
+    )
+    return [
+        pending_suggestions[pending_position]
+        for pending_position in pending_position_by_match_position
+    ]
+
+
+def _shared_sentence_groups(matches: list[FactMatch]) -> dict[int, dict[str, object]]:
+    """Map each match index in a shared sentence to the group fields of the review panel.
+
+    Only a sentence matched in two or more documents forms a group. The group identifier is
+    built from the index of the first match, so the identifier is stable across a resume.
+    """
+    indexes_by_sentence: dict[str, list[int]] = {}
+    for index, match in enumerate(matches):
+        sentence_key = _shared_sentence_key(match)
+        if sentence_key is not None:
+            indexes_by_sentence.setdefault(sentence_key, []).append(index)
+    groups_by_index: dict[int, dict[str, object]] = {}
+    for sentence_indexes in indexes_by_sentence.values():
+        document_keys = {
+            (tuple(matches[index].namespace or ()), matches[index].key)
+            for index in sentence_indexes
+        }
+        if len(document_keys) < 2:
+            continue
+        for index in sentence_indexes:
+            groups_by_index[index] = {
+                "shared_sentence_group": f"shared-sentence-{sentence_indexes[0]}",
+                "shared_sentence_document_count": len(document_keys),
+            }
+    return groups_by_index
+
+
+def _owner_text_by_shared_sentence(
+    matches: list[FactMatch],
+    suggestions: list[tuple[str, str, bool]],
+    per_item_decisions: dict,
+) -> dict[str, str]:
+    """Return the owner's rewrite of each shared sentence, keyed by sentence identity.
+
+    The review panel keeps a shared sentence's cards in step, and this server side rule
+    keeps the stored copies identical for a client that sends a rewrite on one card only.
+    """
+    owner_text_by_sentence: dict[str, str] = {}
+    for index, (match, suggestion) in enumerate(zip(matches, suggestions)):
+        sentence_key = _shared_sentence_key(match)
+        decision_entry = per_item_decisions.get(index) or {}
+        decision_action = (decision_entry.get("action") or "").strip().lower()
+        if sentence_key is None or decision_action not in ("accept", "edit"):
+            continue
+        owner_text = (decision_entry.get("corrected_text") or "").strip()
+        if owner_text and owner_text != (suggestion[0] or "").strip():
+            owner_text_by_sentence.setdefault(sentence_key, owner_text)
+    return owner_text_by_sentence
 
 
 async def _suggest_correction(
@@ -3313,8 +3595,8 @@ async def _run_identity_fact_mutation(
 ) -> GlobalState:
     """Shared body of ``edit_identity_fact`` / ``delete_identity_fact``.
 
-    Owner guard → multi-namespace ``find_fact_matches`` → per-match ``_suggest_correction``
-    fan-out → human-in-the-loop ``interrupt`` → per-item decision parse →
+    Owner guard → multi-namespace ``find_fact_matches`` → one ``_suggest_correction`` per
+    distinct matched sentence → human-in-the-loop ``interrupt`` → per-item decision parse →
     ``apply_resolved_corrections`` → summary ``Command``. The interrupt payload keeps the
     ``kind: "fact_correction"`` shape (with ``correction_kind`` derived from ``is_deletion``)
     so the ``/resume`` contract and the frontend approval panel are unchanged by the tool
@@ -3374,8 +3656,9 @@ async def _run_identity_fact_mutation(
             }
         )
 
-    # Suggest a minimal, in-place edit for EACH matched document independently, so the owner
-    # reviews one editable item per document rather than a single global replacement.
+    # Suggest a minimal, in-place edit for each matched document, so the owner reviews one
+    # editable item per document rather than a single global replacement. A sentence stored
+    # in many documents gets one suggestion, so every stored copy comes out identical.
     async def _suggest_for_match(match: FactMatch) -> tuple[str, str, bool]:
         restated_url_suggestion = _suggest_restated_url_correction(
             match,
@@ -3399,7 +3682,8 @@ async def _run_identity_fact_mutation(
             is_deletion=is_deletion,
         )
 
-    suggestions = await asyncio.gather(*(_suggest_for_match(match) for match in matches))
+    suggestions = await _suggest_once_per_shared_sentence(matches, _suggest_for_match)
+    shared_sentence_groups = _shared_sentence_groups(matches)
 
     # Human-in-the-loop: pause and let the owner decide each matched document independently.
     # Everything above is a pure read, so it is safe to re-run on resume.
@@ -3435,7 +3719,10 @@ async def _run_identity_fact_mutation(
                 "skip": "Leave the document unchanged",
             },
             "matches": [
-                _match_preview(index, match, suggestion, is_deletion=is_deletion)
+                {
+                    **_match_preview(index, match, suggestion, is_deletion=is_deletion),
+                    **shared_sentence_groups.get(index, {}),
+                }
                 for index, (match, suggestion) in enumerate(zip(matches, suggestions))
             ],
         }
@@ -3464,6 +3751,9 @@ async def _run_identity_fact_mutation(
         if isinstance(entry, dict) and "index" in entry
     }
 
+    owner_text_by_sentence = _owner_text_by_shared_sentence(
+        matches, suggestions, per_item_decisions
+    )
     resolved: list[ResolvedCorrection] = []
     for index, (match, suggestion) in enumerate(zip(matches, suggestions)):
         suggested_text, suggested_context, _asserts_flag = suggestion
@@ -3479,6 +3769,11 @@ async def _run_identity_fact_mutation(
             # suggestion as pre-filled in the panel.
             corrected_text = entry.get("corrected_text", suggested_text)
             corrected_context = entry.get("correction_context", suggested_context)
+            shared_sentence_owner_text = owner_text_by_sentence.get(
+                _shared_sentence_key(match) or ""
+            )
+            if shared_sentence_owner_text and (corrected_text or "").strip():
+                corrected_text = shared_sentence_owner_text
             if not (corrected_text or "").strip():
                 # Accepting an empty edit applies nothing — leave the document unchanged.
                 # Deleting a document requires the explicit "remove" action, never an emptied
@@ -3623,8 +3918,12 @@ async def edit_identity_fact(
     <EXAMPLE correction of a method>
     User: "Learn that you do NOT use ROUGE and BERT scores; you use stylometric indicators."
       inaccurate_information: "I use ROUGE and BERT scores to measure the authenticity of responses."
-      corrected_information:  "I measure the authenticity of responses with stylometric indicators, not ROUGE or BERT scores."
-      correction_context:     "I was told I do not use ROUGE or BERT scores and use stylometric indicators instead."
+      corrected_information:  "I measure the authenticity of responses with stylometric indicators."
+      correction_context:     "I was told I measure the authenticity of responses with stylometric indicators."
+    State only what is true in ``corrected_information`` and ``correction_context``. Do not
+    name the rejected detail in either field ("not ROUGE or BERT scores", "rather than X"):
+    every stored copy of the corrected text is placed in the avatar's prompt, and a rejected
+    detail named there is repeated by the avatar.
     </EXAMPLE correction of a method>
 
     <EXAMPLE correction of a quote>

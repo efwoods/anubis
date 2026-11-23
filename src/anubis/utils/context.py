@@ -458,9 +458,9 @@ class GlobalContext:
     """ <Psychological analysis (passive latent-feature analysis of the target)> """
 
     enable_psychological_analysis: str = field(
-        default="TRUE",
+        default="FALSE",
         metadata={
-            "description": "TRUE to run the psycho_analysis_graph branch of process_media_graph, which reads the target's latent psychology (love languages, emotional triggers in dialogue, attachment style, values, moral foundations, typology, defenses, drives, conversational habits) from uploaded media and writes the consolidated psychological profile injected into the avatar's system prompt. FALSE skips the branch; every other upload stage is unaffected. Env ENABLE_PSYCHOLOGICAL_ANALYSIS."
+            "description": "TRUE to run the psycho_analysis_graph branch of process_media_graph, which reads the target's latent psychology (love languages, emotional triggers in dialogue, attachment style, values, moral foundations, typology, defenses, drives, conversational habits) from uploaded media and writes the consolidated psychological profile injected into the avatar's system prompt. FALSE skips the branch; every other upload stage is unaffected. The psycho_analysis_graph branch is off by default because the branch spends one structured-output call per selected document per dimension on every upload batch: on 2026-11-19 the creation of two avatars across 15 upload batches wrote 3,563 psychological analysis rows to the store. Env ENABLE_PSYCHOLOGICAL_ANALYSIS."
         },
     )
 
@@ -2404,6 +2404,52 @@ class GlobalContext:
     )
 
     """ </Browsing Insights> """
+
+    """ <Activity Review> """
+
+    activity_review_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to give the owner's personal avatar the review_my_activity tool, which answers 'what did I do today / this week' from the screen observations already on the owner's threads plus git commits, Claude Code sessions and browser history from connected machines. Reads only; stores nothing. Env ACTIVITY_REVIEW_ENABLED."
+        },
+    )
+
+    activity_review_maximum_threads: int = field(
+        default=200,
+        metadata={
+            "description": "Most conversations with the avatar read from the checkpoints in one activity review, newest first. Env ACTIVITY_REVIEW_MAXIMUM_THREADS."
+        },
+    )
+
+    activity_review_maximum_blocks: int = field(
+        default=120,
+        metadata={
+            "description": "Most screen-activity time blocks returned to the avatar in one review. The block length is the shortest of 15, 30, 60, 120, 240, 480 or 1440 minutes that keeps the non-empty blocks within this count, so a day reads in quarter hours and a week in longer blocks. The lever on how many tokens a week-long review costs. Env ACTIVITY_REVIEW_MAXIMUM_BLOCKS."
+        },
+    )
+
+    activity_review_maximum_gap_seconds: int = field(
+        default=660,
+        metadata={
+            "description": "Longest time, in seconds, one screen observation is counted as lasting until the next observation. Default is the browser's 600-second quiet heartbeat plus 60 seconds; a longer gap is reported as not observed. Env ACTIVITY_REVIEW_MAXIMUM_GAP_SECONDS."
+        },
+    )
+
+    activity_review_maximum_description_characters: int = field(
+        default=240,
+        metadata={
+            "description": "Characters of each screen description kept per segment sample in an activity review. Env ACTIVITY_REVIEW_MAXIMUM_DESCRIPTION_CHARACTERS."
+        },
+    )
+
+    activity_review_maximum_browser_visits: int = field(
+        default=5000,
+        metadata={
+            "description": "Most browser visits read per machine for one activity review. Visits come back oldest first, so a period with more visits than this loses its newest visits and the machine is marked truncated. Env ACTIVITY_REVIEW_MAXIMUM_BROWSER_VISITS."
+        },
+    )
+
+    """ </Activity Review> """
 
     """ Continuous Learning & Personalization """
 

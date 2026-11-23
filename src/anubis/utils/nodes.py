@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -533,6 +534,46 @@ async def _observe_user_in_background(
         logger.warning("observe_user: emotional state failed: %s", emotion_error)
 
 
+# The badge entries of the name changes the latest system-prompt build applied,
+# and the state value the ``load_consciousness`` node writes for the entries.
+_name_fact_entries_of_latest_build: contextvars.ContextVar[list[dict[str, str]] | None] = (
+    contextvars.ContextVar("name_fact_entries_of_latest_build", default=None)
+)
+_name_facts_state_value_of_latest_build: contextvars.ContextVar[dict | None] = (
+    contextvars.ContextVar("name_facts_state_value_of_latest_build", default=None)
+)
+
+
+def _announce_name_facts_once(state: object, latest_message: object) -> None:
+    """Announce the name changes of the latest build once per human message.
+
+    The avatar's loop rebuilds the system prompt after every tool call with the
+    same human message; the stored message id keeps the second build silent.
+    """
+    entries = _name_fact_entries_of_latest_build.get()
+    _name_fact_entries_of_latest_build.set(None)
+    _name_facts_state_value_of_latest_build.set(None)
+    if not entries:
+        return
+    message_id = getattr(latest_message, "id", None)
+    earlier = (state.get("name_facts_learned_in_turn") if isinstance(state, dict) else None) or {}
+    if message_id and earlier.get("message_id") == message_id:
+        return
+    from src.anubis.utils.learning.fact_learned import announce_fact_learned
+
+    for entry in entries:
+        announce_fact_learned(
+            entry["fact"],
+            kind=entry.get("kind", "preference"),
+            status=entry.get("status", "learned"),
+            previous_fact=entry.get("previous_fact"),
+        )
+    if message_id:
+        _name_facts_state_value_of_latest_build.set(
+            {"message_id": message_id, "facts": entries}
+        )
+
+
 async def _apply_names_stated_in_latest_message(
     store: object, user_id: str | None, assistant_id: str | None, latest_message: object
 ) -> tuple[list[str], str | None]:
@@ -552,9 +593,10 @@ async def _apply_names_stated_in_latest_message(
         if (additional_kwargs.get("speakers") or {}).get("others_spoke"):
             return [], None
         from src.anubis.utils.learning.address_correction import (
-            apply_names_stated_in_message,
+            apply_names_stated_in_message_with_reports,
             extract_rejected_address_names,
             extract_stated_user_name,
+            learned_fact_entries_for_name_reports,
         )
 
         latest_text = message_text(latest_message.content)
@@ -562,7 +604,13 @@ async def _apply_names_stated_in_latest_message(
             latest_text
         ):
             return [], None
-        return await apply_names_stated_in_message(store, user_id, assistant_id, latest_text)
+        rejected_names, stated_name, reports = await apply_names_stated_in_message_with_reports(
+            store, user_id, assistant_id, latest_text
+        )
+        _name_fact_entries_of_latest_build.set(
+            learned_fact_entries_for_name_reports(rejected_names, stated_name, reports)
+        )
+        return rejected_names, stated_name
     except Exception as name_error:  # noqa: BLE001 - a name update must never fail a turn
         logger.warning("Applying the names stated in the latest message failed: %s", name_error)
         return [], None
@@ -833,9 +881,16 @@ async def _build_consciousness_system_message_update(
     # The check is a regular expression over the user's own words (no model
     # call), and the store is touched only when the latest message states or
     # rejects a name.
-    await _apply_names_stated_in_latest_message(
-        runtime.store, user_id, assistant_id, state["messages"][-1]
-    )
+    # The pre-request token estimate builds the prompt from a synthetic state and
+    # must not write the store: a name applied by the estimate would be reported
+    # as already known by the turn that follows.
+    if not state.get("skip_name_learning"):
+        await _apply_names_stated_in_latest_message(
+            runtime.store, user_id, assistant_id, state["messages"][-1]
+        )
+    # The learned-fact badge: a name change is announced on the stream here and
+    # handed to ``think`` through the ``load_consciousness`` node's state update.
+    _announce_name_facts_once(state, state["messages"][-1])
 
     user_identity_namespace = (assistant_id, user_id, "identity")
     assistant_identity_namespace = (creator_id, assistant_id, "identity")
@@ -2091,7 +2146,12 @@ async def load_consciousness(
     ``load_consciousness`` tool can share the exact same prompt-building path
     without duplicating the store reads.
     """
-    return await _build_consciousness_system_message_update(state, config, runtime)
+    _name_facts_state_value_of_latest_build.set(None)
+    input_update = await _build_consciousness_system_message_update(state, config, runtime)
+    name_facts_state_value = _name_facts_state_value_of_latest_build.get()
+    if name_facts_state_value:
+        input_update["name_facts_learned_in_turn"] = name_facts_state_value
+    return input_update
 
 
 async def build_system_prompt_text_for_estimation(
@@ -2130,6 +2190,7 @@ async def build_system_prompt_text_for_estimation(
         "messages": [HumanMessage(content=latest_message_text or "")],
         "user_state": {"user_id": user_id},
         "assistant_state": {"assistant_id": assistant_id},
+        "skip_name_learning": True,
     }
     # ``_build_consciousness_system_message_update`` also reads optional
     # ``runtime.context.debug_system_prompt`` via getattr (safe when absent).

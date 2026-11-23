@@ -92,10 +92,10 @@ def _patch_message_fact_grounding(monkeypatch):
     passes. Grounding itself is covered by ``test_self_identity_fact_grounding.py``."""
 
     async def _fake_grounds_fact(*args, **kwargs):
-        return True
+        return identity_tools.FactGroundingVerdict(user_message_states_fact=True)
 
     monkeypatch.setattr(
-        identity_tools, "_user_message_grounds_fact", _fake_grounds_fact
+        identity_tools, "_judge_fact_against_user_message", _fake_grounds_fact
     )
 
 

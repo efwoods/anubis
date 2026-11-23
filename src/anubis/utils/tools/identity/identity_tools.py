@@ -283,6 +283,60 @@ def wrap_fact_with_context(fact: str, fact_context: str) -> str:
     )
 
 
+def verbatim_fact_context(
+    user_message_text: str,
+    *,
+    told_to_the_avatar: bool,
+    rejected_values: list[str] | None = None,
+) -> str:
+    """Return the ``fact_context`` for a fact learned in conversation: the user's own words.
+
+    The ``fact_context`` used to be a summary written by the model that extracted the
+    fact. A summary joins sentences, and joining sentences moves details: "we went to get
+    dirt at the old house. You asked me to come with you." was summarized as "I asked the
+    user to come with me to the old house", the avatar "Mom" then recounted the summary,
+    and the old house was only ever where the dirt was (avatar 681fe8da, 2026-11-18). The
+    user's message is stored word for word instead, so no model can move a place, a time,
+    or a person from one sentence of the message into another sentence.
+
+    ``told_to_the_avatar`` chooses the label in front of the quoted message: a fact about
+    the avatar reads ``The user told me: "..."`` and a fact about the user reads
+    ``The user said: "..."``.
+
+    ``rejected_values`` are names or addresses the user's message rejects ("do not call me
+    David", "NOT linkedin.com/in/old-name"). Every sentence of the message that carries a
+    rejected value is left out of the stored context, because a stored sentence that says
+    "not David" still teaches the name David. A message with no rejected value is stored
+    unchanged, including the line breaks of the message.
+    """
+    message_text = (user_message_text or "").strip()
+    usable_rejected_values = [
+        rejected_value.strip()
+        for rejected_value in (rejected_values or [])
+        if (rejected_value or "").strip()
+    ]
+    if message_text and usable_rejected_values:
+        rejected_value_patterns = [
+            re.compile(r"(?<!\w)" + re.escape(rejected_value) + r"(?!\w)", re.IGNORECASE)
+            for rejected_value in usable_rejected_values
+        ]
+        message_sentences = _split_into_sentences(message_text)
+        kept_sentences = [
+            message_sentence
+            for message_sentence in message_sentences
+            if not any(
+                rejected_value_pattern.search(message_sentence)
+                for rejected_value_pattern in rejected_value_patterns
+            )
+        ]
+        if len(kept_sentences) != len(message_sentences):
+            message_text = " ".join(kept_sentences).strip()
+    if not message_text:
+        return ""
+    speaker_label = "The user told me" if told_to_the_avatar else "The user said"
+    return f'{speaker_label}: "{message_text}"'
+
+
 class SignificantFactAndContext(BaseModel):
     """
     Extract a significant event or occurance from the history of messages. This is a surprising, unexpected, or otherwise important event or occurance. This is a point of no return or an inflection point in the conversation. Or an otherwise important event or occurance. These are not facts about the assistant or user. These are facts about the situation or state of the world within the context of the conversation.
@@ -618,6 +672,28 @@ def _assistant_name_from_config(config: object) -> str:
     return str(assistant_name or "").strip()
 
 
+def _user_name_from_runtime(runtime: object) -> str:
+    """Return the name of the user the avatar is speaking with (else "").
+
+    A fact about the avatar names the user in the third person ("I went to the forest with
+    Evan."), while the user's message says "we" and "me". Without the user's name, the
+    grounding check reads "Evan" as a person the fact added and refuses a fact the user
+    plainly shared (dev test avatar 33af446d, 2026-11-18: six of eight facts refused).
+    """
+    state = getattr(runtime, "state", None) or {}
+    user_state = state.get("user_state") if isinstance(state, dict) else None
+    user_name = (user_state or {}).get("user_name") if isinstance(user_state, dict) else None
+    if not user_name:
+        config = getattr(runtime, "config", None) or {}
+        configurable = config.get("configurable") or {} if isinstance(config, dict) else {}
+        user_ctx = configurable.get("user_ctx") or {}
+        if isinstance(user_ctx, dict):
+            user_name = user_ctx.get("name")
+        else:
+            user_name = getattr(user_ctx, "name", None)
+    return str(user_name or "").strip()
+
+
 _QUOTE_MATCH_NON_WORD_CHARACTERS = re.compile(r"[^a-z0-9]+")
 
 
@@ -692,7 +768,61 @@ class _UserMessageGroundsFact(BaseModel):
             "and choosing the first that applies."
         )
     )
+    sentence_of_user_message_stating_the_action: str = Field(
+        default="",
+        description=(
+            "The ONE sentence of USER_MESSAGE that states the main action of PROPOSED_FACT, "
+            "copied VERBATIM from USER_MESSAGE. Exactly one sentence, never two."
+        ),
+    )
+    details_missing_from_that_sentence: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Every place, time, object, purpose, reason, or quoted wording that "
+            "PROPOSED_FACT attaches to the main action and that "
+            "`sentence_of_user_message_stating_the_action` does not contain, each copied "
+            "from PROPOSED_FACT (for example ['to the old house']). Follow the `CHECK THE "
+            "DETAILS AGAINST ONE SENTENCE` rules in the system prompt. Empty when the one "
+            "sentence contains every detail."
+        ),
+    )
+    proposed_fact_preserves_meaning: bool = Field(
+        default=True,
+        description=(
+            "False when PROPOSED_FACT says anything USER_MESSAGE does not say, judged by "
+            "the `THE MEANING MUST MATCH THE MESSAGE` rules in the system prompt. A "
+            "difference in grammatical person alone is never a difference in meaning."
+        ),
+    )
+    meaning_difference: str = Field(
+        default="",
+        description=(
+            "When `proposed_fact_preserves_meaning` is false: one short sentence naming "
+            "what PROPOSED_FACT says that USER_MESSAGE does not say. Empty otherwise."
+        ),
+    )
     reason: str = Field(description="One short sentence explaining the decision.")
+
+
+@dataclass(frozen=True)
+class FactGroundingVerdict:
+    """The outcome of checking one proposed avatar fact against the user's latest message.
+
+    ``user_message_states_fact`` is the source check: the user's most recent message is
+    where the information came from. ``fact_preserves_meaning`` is the meaning check: the
+    first-person rewrite says nothing the user's message does not say.
+    ``meaning_difference`` names the difference when the meaning check fails, so the tool
+    can tell the extracting model exactly what to take back out of the fact.
+    """
+
+    user_message_states_fact: bool
+    fact_preserves_meaning: bool = True
+    meaning_difference: str = ""
+
+    @property
+    def is_accepted(self) -> bool:
+        """Whether the fact may be stored: sourced from the message, meaning intact."""
+        return self.user_message_states_fact and self.fact_preserves_meaning
 
 
 _FACT_GROUNDING_SYSTEM_PROMPT = """You classify where a proposed fact about an AI avatar came \
@@ -702,6 +832,7 @@ states in the user's own most recent message.
 You are given:
 - ASSISTANT_NAME: the name of the person the assistant is an avatar of.
 - ASSISTANT_PREVIOUS_MESSAGE: the assistant's own message immediately before USER_MESSAGE.
+- USER_NAME: the name of the user who wrote USER_MESSAGE, when the name is known.
 - USER_MESSAGE: the user's most recent message, verbatim.
 - PROPOSED_FACT: a first-person fact about the assistant that another component wants to store.
 
@@ -711,6 +842,16 @@ in the third person (a full name, surname, first name, nickname, or title, with 
 honorific). A statement about ASSISTANT_NAME is a statement about the assistant. Example: when \
 ASSISTANT_NAME is "Dr. Jane Goodall", the message "Jane Goodall was born in London" states a \
 fact about the assistant.
+
+HOW PROPOSED_FACT REFERS TO THE USER
+In USER_MESSAGE, "I", "me", and "my" mean the user, and "we", "us", and "our" mean the user \
+and the assistant together. PROPOSED_FACT is written from the assistant's point of view, so \
+PROPOSED_FACT names the user in the third person: by USER_NAME, as "the user", or as "[user \
+name]". Every one of those names is the same person as "I" and "me" in USER_MESSAGE. Example: \
+when USER_NAME is "Evan", the message "there was a snake next to me" and the fact "There was \
+a snake next to Evan." say the same thing, and the message "we went to the forest" and the \
+fact "I went to the forest with Evan." say the same thing. Naming the user is never an added \
+person and never a changed actor.
 
 COMPARE INFORMATION, NOT GRAMMAR
 PROPOSED_FACT has already been rewritten into the first person on purpose. A difference in \
@@ -791,6 +932,64 @@ stays "repeats_what_the_assistant_already_said", however exactly the words match
 saying "that is beautiful, your mother Vanne supported your love of animals" right after the \
 assistant said "I grew up in Bournemouth with my mother Vanne, who supported my love of \
 animals" is a quotable span AND an echo — it is an echo.
+
+THE MEANING MUST MATCH THE MESSAGE
+Grammatical person is the only difference PROPOSED_FACT may have from USER_MESSAGE. Set \
+`proposed_fact_preserves_meaning` to false when PROPOSED_FACT says anything that USER_MESSAGE \
+does not say, and name the added or changed claim in `meaning_difference`. Judge \
+`proposed_fact_preserves_meaning` separately from `user_message_role`: a PROPOSED_FACT can \
+come from USER_MESSAGE and still change what USER_MESSAGE says.
+
+The two most common changes of meaning:
+- A DETAIL MOVED BETWEEN SENTENCES. USER_MESSAGE states a place, time, object, purpose, or \
+person in one sentence, and PROPOSED_FACT attaches that detail to an action that USER_MESSAGE \
+states in a different sentence. Example: USER_MESSAGE is "There was this one time we went to \
+get dirt at the old house. You asked me to come with you." The old house is where the dirt \
+was. USER_MESSAGE never says where the assistant asked the user to come. PROPOSED_FACT "I \
+asked the user to come with me to the old house." changes the meaning, and so does "I asked \
+the user to come with me to get dirt at the old house." PROPOSED_FACT "I asked the user to \
+come with me." preserves the meaning, and so does "I went to get dirt at the old house with \
+the user."
+- A SHARED ACTION TURNED INTO A CAUSED ACTION. USER_MESSAGE says two people did an action \
+together ("we tried new foods"), and PROPOSED_FACT says the assistant made, had, asked, \
+influenced, or taught the other person to do the action ("I made another person try new \
+foods."). PROPOSED_FACT "I tried new foods with another person." preserves the meaning.
+
+A reason, a feeling, an order of events, or quoted words that USER_MESSAGE does not state \
+also change the meaning.
+
+CHECK THE DETAILS AGAINST ONE SENTENCE
+Do the check in three steps, and write each step into the matching field.
+1. Find the main action of PROPOSED_FACT (for example "asked the user to come"). Copy the ONE \
+sentence of USER_MESSAGE that states that action into \
+`sentence_of_user_message_stating_the_action`. Copy one sentence only, even when the \
+neighbouring sentences are about the same event.
+2. Read every place, time, object, purpose, and reason that PROPOSED_FACT attaches to the \
+main action. For each detail, look for the detail inside the ONE sentence copied in step 1. \
+A detail that appears only in a DIFFERENT sentence of USER_MESSAGE is missing from the one \
+sentence. List every missing detail in `details_missing_from_that_sentence`. Example: \
+PROPOSED_FACT is "I asked the user to come with me to get dirt at the old house." The one \
+sentence is "You asked me to come with you." The one sentence contains no purpose and no \
+place, so the missing details are ["to get dirt", "at the old house"].
+3. Set `proposed_fact_preserves_meaning` to false whenever \
+`details_missing_from_that_sentence` is not empty.
+Never list the user or the assistant. Never list a fuller name for a person, a place, or a \
+thing that the one sentence already mentions by a shorter name or a pronoun: when the one \
+sentence is "We went to the forest that was next to the house." and an earlier sentence of \
+USER_MESSAGE calls that house "the old house", then "next to the old house" in PROPOSED_FACT \
+is the same house and is NOT a missing detail; "the wheelbarrow of dirt" for "that" is NOT a \
+missing detail either.
+
+These are NOT changes of meaning:
+- PROPOSED_FACT covers only one part of USER_MESSAGE. Each PROPOSED_FACT is one atomic fact, \
+and the other parts of USER_MESSAGE are stored as separate facts.
+- PROPOSED_FACT names a person or a thing that USER_MESSAGE refers to with a pronoun or a \
+shorter name, when USER_MESSAGE makes the reference certain: "me" becomes "the user" or the \
+user's name, and "the house" becomes "the old house" when USER_MESSAGE names only one house.
+- PROPOSED_FACT is in the first person where USER_MESSAGE says "you" or ASSISTANT_NAME.
+- PROPOSED_FACT names the user by USER_NAME, as "the user", or as "[user name]" where \
+USER_MESSAGE says "I", "me", or "my", and PROPOSED_FACT says "I ... with" the user where \
+USER_MESSAGE says "we".
 """
 
 
@@ -799,8 +998,38 @@ async def _user_message_grounds_fact(
     user_message_text: str,
     assistant_name: str = "",
     assistant_previous_message_text: str = "",
+    user_name: str = "",
 ) -> bool:
+    """Return whether ``fact`` may be stored: sourced from the user's message, meaning intact.
+
+    A yes-or-no view of ``_judge_fact_against_user_message`` for a caller that needs no
+    explanation of a refusal.
+    """
+    fact_grounding_verdict = await _judge_fact_against_user_message(
+        fact,
+        user_message_text,
+        assistant_name=assistant_name,
+        assistant_previous_message_text=assistant_previous_message_text,
+        user_name=user_name,
+    )
+    return fact_grounding_verdict.is_accepted
+
+
+async def _judge_fact_against_user_message(
+    fact: str,
+    user_message_text: str,
+    assistant_name: str = "",
+    assistant_previous_message_text: str = "",
+    user_name: str = "",
+) -> FactGroundingVerdict:
     """Verify the user's most recent message is the source the ``fact`` was derived from.
+
+    The same model call also judges whether the first-person rewrite kept the meaning of
+    the user's message. A fact can be sourced from the message and still say something the
+    message does not: "we went to get dirt at the old house. You asked me to come with
+    you." became "I asked the user to come with me to get dirt at the old house", which
+    passed the source check because every word of the fact is in the message. The verdict
+    reports the source check and the meaning check separately.
 
     Safeguard for ``update_self_identity_mem_from_user_txt``: the model frequently "learns"
     facts it actually surfaced from its own retrieved consciousness (identity/quote documents)
@@ -830,9 +1059,17 @@ async def _user_message_grounds_fact(
             "to ground the fact against",
             fact,
         )
-        return False
+        return FactGroundingVerdict(user_message_states_fact=False)
     try:
-        model = init_model(response_format=_UserMessageGroundsFact)
+        # The meaning check runs on the inference model, not the classification model.
+        # Measured 2026-11-18 on the dirt message: the classification model accepted "I
+        # asked Evan to come with me to the old house." in 12 of 12 calls and, once made
+        # stricter, refused correct facts in 10 of 20 calls; the inference model refused
+        # the changed facts in 12 of 12 calls.
+        model = init_model(
+            response_format=_UserMessageGroundsFact,
+            structured_output_on_inference_model=True,
+        )
         result = await model.ainvoke(
             [
                 SystemMessage(content=_FACT_GROUNDING_SYSTEM_PROMPT),
@@ -840,6 +1077,7 @@ async def _user_message_grounds_fact(
                     content=(
                         f"ASSISTANT_NAME: {assistant_name or '(not provided)'}\n\n"
                         f"ASSISTANT_PREVIOUS_MESSAGE: {assistant_previous_message_text or '(none)'}\n\n"
+                        f"USER_NAME: {user_name or '(not provided)'}\n\n"
                         f"USER_MESSAGE: {user_message_text}\n\n"
                         f"PROPOSED_FACT: {fact}"
                     )
@@ -850,7 +1088,7 @@ async def _user_message_grounds_fact(
             result.proposed_fact_kind != "identity_fact"
             or result.user_message_role != "states_the_information"
         ):
-            return False
+            return FactGroundingVerdict(user_message_states_fact=False)
         # The classification alone is not enough: a message that shares one real fact makes
         # the model read every proposed fact as shared, including one it surfaced from an
         # earlier turn. The quoted span has to actually be in the message.
@@ -863,14 +1101,40 @@ async def _user_message_grounds_fact(
                 fact,
                 result.supporting_quote_from_user_message,
             )
-            return False
-        return True
+            return FactGroundingVerdict(user_message_states_fact=False)
+        details_missing_from_the_sentence = [
+            str(missing_detail).strip()
+            for missing_detail in (result.details_missing_from_that_sentence or [])
+            if str(missing_detail).strip()
+        ]
+        if not result.proposed_fact_preserves_meaning or details_missing_from_the_sentence:
+            meaning_difference = (result.meaning_difference or "").strip()
+            if details_missing_from_the_sentence and not meaning_difference:
+                # The verifier listed details without writing the explanation; build the
+                # explanation from the list so the extracting model knows what to remove.
+                meaning_difference = (
+                    "The user's sentence "
+                    f'"{(result.sentence_of_user_message_stating_the_action or "").strip()}" '
+                    "does not say: " + "; ".join(details_missing_from_the_sentence) + "."
+                )
+            logger.info(
+                "update_self_identity_mem_from_user_txt: refusing %r — the fact changes "
+                "the meaning of the user's most recent message: %s",
+                fact,
+                meaning_difference,
+            )
+            return FactGroundingVerdict(
+                user_message_states_fact=True,
+                fact_preserves_meaning=False,
+                meaning_difference=meaning_difference,
+            )
+        return FactGroundingVerdict(user_message_states_fact=True)
     except Exception:
         logger.exception(
             "update_self_identity_mem_from_user_txt: fact-grounding check failed; "
             "refusing the fact"
         )
-        return False
+        return FactGroundingVerdict(user_message_states_fact=False)
 
 
 class _ProposedFactStoredFactRelationship(BaseModel):
@@ -977,15 +1241,13 @@ class AssistantFactAndContext(BaseModel):
 
     <Example>
     Input: There was this one time where you went on a picnic and we tried new foods and rolled around in a bed of flowers.
-    fact_context: I was told that I once went on a picnic and influenced another person to try new foods and rolled around in a bed of flowers with that person.
     Fact: I once went on a picnic.
-    Fact: I had another person try new foods.
-    Fact: I rolled around in a bed of flowers with this person.
+    Fact: I tried new foods with another person.
+    Fact: I rolled around in a bed of flowers with another person.
     </Example>
 
     <Example>
     Input: You have long flowing curly hair.
-    fact_context: I was told that I have long flowing curly hair.
     Fact: I have long flowing curly hair.
     </Example>
 
@@ -1016,14 +1278,17 @@ class AssistantFactAndContext(BaseModel):
         description="One distinct fact about the assistant shared by the user, REWRITTEN IN FIRST PERSON. The user addresses the assistant in the second person; ONLY the tokens that refer to the assistant — 'you / your / yours / yourself / yourselves' and the assistant's given name — become first person ('I / my / mine / me / myself'). EVERY OTHER PERSON stays in the third person: bare third-person pronouns ('he / she / they / him / her / their') and named people ('your dad', 'your mom') refer to someone OTHER than the assistant and are NOT converted to 'I'/'we' — only flip a target-referring possessive attached to them ('your dad' -> 'my dad'). 'they' for other people stays 'they' (use 'we' only when the group includes the assistant). Sanity check: a rewrite that is impossible about yourself (e.g. 'I married my mother') means a third-person subject was wrongly read as you — keep it third person ('He married my mother'). Change ONLY the grammatical person — preserve every specific (names, places, titles, dates, quoted words), the exact meaning, and the tense; add and remove nothing."
     )
     fact_context: str = Field(
-        description="A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message."
+        default="",
+        description="Leave empty. The server stores the user's most recent message, word for word, as the context of the fact.",
     )
 
 
 @tool("update_self_identity_mem_from_user_txt", args_schema=AssistantFactAndContext)
 async def update_self_identity_mem_from_user_txt(  # pseudo identity update using namespace (USER_ID, ASSISTANT_ID, 'MEMORY')
     fact_shared_about_the_assistant_from_the_user: str,
-    fact_context: str,
+    # Accepted so a model that still sends a summary does not fail validation, and never
+    # stored: the stored context is the user's own message (``verbatim_fact_context``).
+    fact_context: str = "",
     # Hide these arguments from the model.
     runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
 ) -> GlobalState:
@@ -1040,8 +1305,8 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
 
     Decompose the user's message into EVERY distinct, atomic fact and call this tool
     ONCE FOR EACH distinct fact. A single message — especially a story — usually
-    contains MANY separate facts; make as many calls as there are facts, each with
-    the SAME ``fact_context``. Do not stop after the first fact. Even a single
+    contains MANY separate facts; make as many calls as there are facts. Do not
+    stop after the first fact. Even a single
     sentence is usually many facts: clauses joined by commas, "and", or "that" each
     carry a separate atomic fact — split every one into its own call. For example,
     "you are INTJ, that you speak directly, and have never faced hardship you could
@@ -1065,6 +1330,23 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     - "I read a book in the van while you drove." -> "I drove the van while [user name] read a book."
     - "You would say 'write small' when I wrote too large." -> "I would say 'write small' when [user name] wrote too large."
     </SHARED MEMORIES BELONG TO YOU>
+
+    <EACH FACT SAYS ONLY WHAT ONE SENTENCE SAYS>
+    Every fact keeps the meaning of the sentence the fact came from. A place, a time,
+    an object, a purpose, or a person stays in the sentence that states that detail.
+    Never attach a detail from one sentence to an action from another sentence, and
+    never turn an action two people did together into an action one person made the
+    other person do.
+    - "We went to get dirt at the old house. You asked me to come with you." ->
+      "I went to get dirt at the old house with [user name]." and
+      "I asked [user name] to come with me."
+      WRONG: "I asked [user name] to come with me to the old house." The user's
+      message never says where you asked [user name] to come.
+    - "We tried new foods." -> "I tried new foods with [user name]."
+      WRONG: "I made [user name] try new foods."
+    This tool refuses a fact that changes the meaning of the user's message and
+    names the changed claim; call the tool again with the changed claim removed.
+    </EACH FACT SAYS ONLY WHAT ONE SENTENCE SAYS>
 
     <NEW DETAIL IS NEW INFORMATION>
     A new quote, a new wording of what you said, or a new detail about a stored memory
@@ -1100,39 +1382,28 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
 
     DO NOT CALL THIS TOOL ON INFORMATION THAT WAS PRESENTED FROM THE ASSISTANT IN EARLIER CONTEXT OF THE CONVERSATION (INFORMATION YOU PRESENTED YOURSELF)
 
-    THE FACT NEEDS TO LOGICALLY BE SUPPORTED FROM THE FACT_CONTEXT:
+    THE FACT NEEDS TO BE LOGICALLY SUPPORTED BY THE USER'S MOST RECENT MESSAGE:
 
     <COUNTER EXAMPLE>
-    THE FACT SHARED ABOUT THE ASSISTANT NEEDS TO BE IN ALIGNMENT WITH THE CONTEXT OF THE FACT. THIS IS AN EXAMPLE OF A FAILURE:
-    
+    THIS IS AN EXAMPLE OF A FAILURE:
+
     USER: "Your favorite color is blue"
-    fact_context: The user said: "Your favorite color is blue."
     fact_shared_about_the_assistant_from_the_user: I don’t have a favorite color.
 
     </COUNTER EXAMPLE>
 
     <EXAMPLE>
-    THE FACT SHARED ABOUT THE ASSISTANT NEEDS TO BE IN ALIGNMENT WITH THE CONTEXT OF THE FACT. 
     THIS IS AN EXAMPLE OF A SUCCESS:
-    
+
     USER: "Your favorite color is blue"
-    fact_context: The user said: "Your favorite color is blue."
     fact_shared_about_the_assistant_from_the_user: My favorite color is blue.
 
     </EXAMPLE>
 
     <FACTCONTEXT>
-    THE CONTEXT OF THE FACTS ARE SUCH THAT YOU HAVE BEEN INFORMED OF THIS INFORMATION.
-    THESE ARE FACTS SHARED IN CONVERSATION FROM THE USER. DO NOT REWRITE THESE FACTS AS IF YOU SAID THESE FACTS YOURSELF.
-    INSTEAD, INDICATE THAT YOU HAVE BEEN TOLD OR HAVE ON GOOD AUTHORITY THIS INFORMATION.
-
-    NEVER DO THE FOLLOWING:
-    <FACT_CONTEXT>You said: "You have been interested in AI after reading a book in your youth, that you speak directly and openly as if you are not afraid of the world and have never experienced harm or evil or hardship that you could not overcome."</FACT_CONTEXT>
-    <FACT>I have been interested in AI after reading a book in my youth.</FACT></FACT_CONTEXT_AND_FACT>
-
-    THE CORRECT FACT CONTEXT IS THE FOLLOWING:
-    I was told that I have been interested in AI after reading a book in my youth.
-
+    Leave ``fact_context`` empty. The server stores the user's most recent message,
+    word for word, as the context of every fact learned from the user's most recent
+    message, so the context never needs to be written or summarized.
     </FACTCONTEXT>
 
     </INSTRUCTIONS>
@@ -1151,26 +1422,22 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     <EXAMPLE>
     Input:
     "Your name is Shivon Zilis, you have twins, and you love hockey."
-    Becomes three separate tool calls, one per fact (each with the SAME full context):
+    Becomes three separate tool calls, one per fact:
       1. assistant_fact: "My name is Shivon Zilis."
       2. assistant_fact: "I have twins."
       3. assistant_fact: "I love hockey."
-      fact_context (identical on all three): "I was told my name
-      name is Shivon Zilis, that I have twins, and that I love hockey."
     </EXAMPLE>
 
 
     <Example>
     Input: There was this one time where you went on a picnic and we tried new foods and rolled around in a bed of flowers.
-    fact_context: I was told that I once went on a picnic and influenced another person to try new foods and rolled around in a bed of flowers with that person.
     Fact: I once went on a picnic.
-    Fact: I made another person try new foods.
-    Fact: I rolled around in a bed of flowers with this person.
+    Fact: I tried new foods with another person.
+    Fact: I rolled around in a bed of flowers with another person.
     </Example>
 
     <Example>
     Input: You have long flowing curly hair.
-    fact_context: I was told that I have long flowing curly hair.
     Fact: I have long flowing curly hair.
     </Example>
 
@@ -1178,9 +1445,6 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     DO NOT store behavior requests or build instructions, and DO NOT store facts that
     were never rewritten into first person. The following is WRONG on both counts and
     must NEVER be produced:
-      fact_context: 'In the conversation, the user says: I want you to sound
-        authentic like shivon zilis and be able to be integrated in social media
-        applications and perform analysis on your personal data...'
       fact_shared_about_the_assistant_from_the_user: 'I want you to sound authentic
         like shivon zilis and be able to be integrated in social media applications
         and perform analysis on your personal data.'
@@ -1196,13 +1460,8 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
             movie Crouching Tiger, Hidden Dragon" is stored as:
             "I picked up my glasses before seeing the movie Crouching Tiger, Hidden Dragon."
 
-        fact_context: A concise summary of the original background context of the message in which the user shared the fact.
-            Use the SAME summary for every fact extracted from the same message. For example:
-            "On the day I went to get my first glasses, I picked them up before seeing
-            Crouching Tiger, Hidden Dragon; everything was suddenly clear — I could read
-            the signs at the back of Walmart and see individual leaves on the trees, which
-            I told my mom; she felt bad I couldn't see before, but I told her it was okay.
-            I loved watching action and sci-fi movies with my mom, and I was her guy and buddy."
+        fact_context: Leave empty. The server stores the user's most recent message,
+            word for word, as the context of the fact.
     """
     logger.info(f"learn_information about user breakpoint")
 
@@ -1230,14 +1489,41 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     # quote-verified grounding check — never accept on embedding similarity alone.
     latest_user_message_text = _latest_user_message_text(runtime.state.get("messages"))
 
-    if not await _user_message_grounds_fact(
+    fact_grounding_verdict = await _judge_fact_against_user_message(
         fact_shared_about_the_assistant_from_the_user,
         latest_user_message_text,
         assistant_name=_assistant_name_from_config(runtime.config),
         assistant_previous_message_text=_assistant_message_before_latest_user_message(
             runtime.state.get("messages")
         ),
+        user_name=_user_name_from_runtime(runtime),
+    )
+    if (
+        fact_grounding_verdict.user_message_states_fact
+        and not fact_grounding_verdict.fact_preserves_meaning
     ):
+        # The fact came from the user's message but says something the message does not
+        # say (a place moved onto another sentence's action, a shared action turned into
+        # a caused action). Name the changed claim so the model restates the fact.
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            f'Not learned: "{fact_shared_about_the_assistant_from_the_user}" '
+                            "changes the meaning of the user's most recent message: "
+                            f"{fact_grounding_verdict.meaning_difference or 'the fact says something the user did not say.'} "
+                            "Call update_self_identity_mem_from_user_txt again with the "
+                            "fact restated so that the fact says only what one sentence of "
+                            "the user's most recent message says. Change only the "
+                            "grammatical person."
+                        ),
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ]
+            }
+        )
+    if not fact_grounding_verdict.is_accepted:
         tool_call_id = runtime.tool_call_id
         update = {
             "messages": [
@@ -1462,6 +1748,21 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
             )
         # "new_information" falls through to storing the proposed fact.
 
+    # The stored context is the user's own message, never the model's summary of the
+    # message: a summary moved "the old house" onto "asked me to come" (avatar 681fe8da).
+    from src.anubis.utils.learning.address_correction import (
+        extract_rejected_address_names,
+    )
+
+    fact_context = verbatim_fact_context(
+        latest_user_message_text,
+        told_to_the_avatar=True,
+        rejected_values=[
+            *negated_urls_in_text(latest_user_message_text),
+            *extract_rejected_address_names(latest_user_message_text),
+        ],
+    )
+
     searchable_page_content = wrap_fact_with_context(
         fact_shared_about_the_assistant_from_the_user, fact_context
     )
@@ -1556,8 +1857,6 @@ class UserFactAndContext(BaseModel):
     - "I have brown hair and glasses."
     - "I am a fan of Critical Role."
     - "I am a fan of Laura Bailey."
-    Fact Context:
-    - "While introducing himself, Evan said his name is Evan, that he has brown hair and glasses, and that he is a fan of Critical Role and Laura Bailey."
     </Example>
     """
 
@@ -1570,7 +1869,8 @@ class UserFactAndContext(BaseModel):
     fact_context: Annotated[
         str,
         Field(
-            description="A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message."
+            default="",
+            description="Leave empty. The server stores the user's most recent message, word for word, as the context of the fact.",
         ),
     ]
     replaces_user_facts: Annotated[
@@ -1601,12 +1901,14 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
             description="One distinct fact about the user shared by the user, preserved verbatim (not rewritten)."
         ),
     ],
+    # Stored only when the thread holds no user message to quote; otherwise the stored
+    # context is the user's own message (``verbatim_fact_context``).
     fact_context: Annotated[
         str,
         Field(
-            description="A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message."
+            description="Leave empty. The server stores the user's most recent message, word for word, as the context of the fact."
         ),
-    ],
+    ] = "",
     replaces_user_facts: Annotated[
         list[str] | None,
         Field(
@@ -1668,13 +1970,9 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
     exactly as the user stated them, so the stored memory can later recount the full
     story precisely. Do not change the information of the fact.
 
-    For fact_context, capture the original background context of the message in which the user presented the fact — a concise
-    summary of the WHOLE message or story the user shared, preserving every
-    surrounding detail (who, what, when, where, why, and the order events happened).
-    Pass the SAME complete context summary on every call for facts that came from the
-    same message, so each stored fact carries enough of the original story to recount
-    it in full. Do not shrink the context down to only the single fact, and do not
-    rewrite or paraphrase the facts themselves.
+    Leave fact_context empty. The server stores the user's most recent message, word
+    for word, as the context of every fact learned from the user's most recent
+    message. Do not rewrite or paraphrase the facts themselves.
 
     THE FACT MUST BE PRESENTED ONLY FROM THE PREVIOUS MESSAGE (MOST RECENT MESSAGE) FROM THE USER.
 
@@ -1703,13 +2001,11 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
     <EXAMPLE>
     Input:
     "Hi, my name is Evan, I have brown hair and glasses, and I'm a fan of Critical Role."
-    Becomes four separate tool calls, one per fact (each with the SAME full context):
+    Becomes four separate tool calls, one per fact:
       1. user_fact: "My name is Evan."
       2. user_fact: "I have brown hair."
       3. user_fact: "I have glasses."
       4. user_fact: "I am a fan of Critical Role."
-      fact_context (identical on all four): "While introducing himself, Evan said his
-      name is Evan, that he has brown hair and glasses, and that he is a fan of Critical Role."
 
     Identity facts include name, description, appearance, history, experiences,
     relationships, feelings, opinions, biases, values, beliefs, and goals (listed
@@ -1770,13 +2066,9 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
     exactly as the user stated them, so the stored memory can later recount the full
     story precisely. Do not change the information of the fact.
 
-    For fact_context, capture the ENTIRE original background context — a concise
-    summary of the WHOLE message or story the user shared, preserving every
-    surrounding detail (who, what, when, where, why, and the order events happened).
-    Pass the SAME complete context summary on every call for facts that came from the
-    same message, so each stored fact carries enough of the original story to recount
-    it in full. Do not shrink the context down to only the single fact, and do not
-    rewrite or paraphrase the facts themselves.
+    Leave fact_context empty. The server stores the user's most recent message, word
+    for word, as the context of every fact learned from the user's most recent
+    message. Do not rewrite or paraphrase the facts themselves.
     </INSTRUCTIONS>
     """
     logger.info(f"breakpoint")
@@ -1826,6 +2118,17 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
             fact_names_user_with_rejected_name(user_fact, rejected_user_name)
             for rejected_user_name in all_rejected_user_names
         ):
+            from src.anubis.utils.learning.address_correction import (
+                REJECTED_NAME_LEARNED_FACT,
+            )
+            from src.anubis.utils.learning.fact_learned import (
+                STATUS_REMOVED,
+                announce_fact_learned,
+            )
+
+            announce_fact_learned(
+                REJECTED_NAME_LEARNED_FACT, kind="preference", status=STATUS_REMOVED
+            )
             return Command(
                 update={
                     "messages": [
@@ -2026,6 +2329,21 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
             )
 
     identity_id = str(uuid.uuid4())
+
+    # The stored context is the user's own message, never the model's summary of the
+    # message: a summary rewrote "You asked me to come with you" as "entering the forest
+    # after Mom asked him to come" (avatar 681fe8da). A sentence that carries a name the
+    # user rejected is left out of the stored context. The model's own ``fact_context``
+    # is kept only when the thread holds no user message to quote.
+    fact_context = (
+        verbatim_fact_context(
+            latest_user_message_text_for_names,
+            told_to_the_avatar=False,
+            rejected_values=all_rejected_user_names,
+        )
+        if latest_user_message_text_for_names.strip()
+        else fact_context
+    )
 
     searchable_page_content = wrap_fact_with_context(user_fact, fact_context)
 

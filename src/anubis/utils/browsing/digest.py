@@ -14,7 +14,7 @@ shape of the digest is unit-tested without a model, a machine, or a browser.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import UTC, datetime, tzinfo
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
 
@@ -94,8 +94,16 @@ def _address_worth_showing(visit: Mapping[str, Any]) -> str:
     return address
 
 
-def summarize_visits(visits: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
-    """Fold visits into the counts and samples the digest is written from."""
+def summarize_visits(
+    visits: Iterable[Mapping[str, Any]], *, owner_zone: tzinfo | None = None
+) -> dict[str, Any]:
+    """Fold visits into the counts and samples the digest is written from.
+
+    ``owner_zone`` buckets ``hours``, ``weekdays`` and ``days_covered`` in the
+    owner's own time zone. Without ``owner_zone`` each visit keeps the zone the
+    visit time was written in, which is the behaviour the browsing-insights
+    pass was built on.
+    """
     kept = meaningful_visits(visits)
     hosts = Counter(str(visit.get("host") or "") for visit in kept)
     searches: list[str] = []
@@ -118,6 +126,10 @@ def summarize_visits(visits: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             addresses.append(address)
         browsers[str(visit.get("browser_name") or "")] += 1
         moment = _visit_moment(visit)
+        if moment is not None and owner_zone is not None:
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=UTC)
+            moment = moment.astimezone(owner_zone)
         if moment is not None:
             hours[moment.hour] += 1
             weekdays[moment.strftime("%A")] += 1

@@ -114,9 +114,9 @@ def _patch_models(monkeypatch):
     monkeypatch.setattr(identity_tools, "_suggest_correction", _fake_suggest_correction)
 
     async def _fake_grounds_fact(*args, **kwargs):
-        return True
+        return identity_tools.FactGroundingVerdict(user_message_states_fact=True)
 
-    monkeypatch.setattr(identity_tools, "_user_message_grounds_fact", _fake_grounds_fact)
+    monkeypatch.setattr(identity_tools, "_judge_fact_against_user_message", _fake_grounds_fact)
 
     async def _fake_extract(config):
         return (

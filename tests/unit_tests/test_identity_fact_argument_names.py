@@ -29,10 +29,9 @@ def test_the_model_is_still_shown_the_canonical_argument_name():
         "fact_shared_about_the_assistant_from_the_user",
         "fact_context",
     ]
-    assert schema["required"] == [
-        "fact_shared_about_the_assistant_from_the_user",
-        "fact_context",
-    ]
+    # ``fact_context`` is optional: the server stores the user's own message as the
+    # context, so the model is told to leave the argument empty.
+    assert schema["required"] == ["fact_shared_about_the_assistant_from_the_user"]
 
 
 @pytest.mark.parametrize(

@@ -219,6 +219,20 @@ def collect_learned_facts_from_messages(
     return collected
 
 
+def seed_turn_learned_facts(entries: list[dict[str, str]] | None) -> None:
+    """Add facts learned before the avatar's turn began to the turn's list.
+
+    A name the user states is stored while the system prompt is built, before
+    ``begin_turn`` runs; seeding the entries puts the name on the reply's
+    ``learned_facts`` so the badge survives a reload.
+    """
+    for entry in entries or []:
+        if isinstance(entry, dict) and entry.get("fact"):
+            TurnLearnedFactsCollector.add(
+                {key: str(value) for key, value in entry.items() if value}
+            )
+
+
 def announce_fact_learned(
     fact: str,
     *,

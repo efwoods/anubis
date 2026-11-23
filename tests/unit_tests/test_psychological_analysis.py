@@ -596,3 +596,41 @@ def test_cognitive_style_is_registered_and_covers_reasoning_and_bias():
         "sunk_cost",
     ):
         assert trait in prompt, trait
+
+
+def test_psychological_analysis_is_inert_unless_the_flag_is_explicitly_true():
+    """An upload must spend no psychological analysis model call by default."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from src.subgraphs.psycho_analysis_graph import graph as psycho_analysis_module
+
+    assert (
+        GlobalContext.__dataclass_fields__["enable_psychological_analysis"].default
+        == "FALSE"
+    )
+
+    upload_state = {
+        "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": [
+            Document(page_content="I build things.", metadata={"target_name": "Ada"})
+        ]
+    }
+    # A context object without the flag attribute must also leave the branch inert.
+    inert_contexts = [
+        SimpleNamespace(enable_psychological_analysis="FALSE"),
+        SimpleNamespace(enable_psychological_analysis=""),
+        SimpleNamespace(enable_psychological_analysis=None),
+        SimpleNamespace(),
+    ]
+    for inert_context in inert_contexts:
+        runtime = SimpleNamespace(context=inert_context, store=None)
+        with patch.object(
+            psycho_analysis_module.psycho_analysis_graph, "ainvoke", new=AsyncMock()
+        ) as psycho_analysis_graph_invocation:
+            node_update = asyncio.run(
+                psycho_analysis_module.psycho_analysis(
+                    upload_state, config={}, runtime=runtime
+                )
+            )
+        assert node_update == {}
+        psycho_analysis_graph_invocation.assert_not_called()

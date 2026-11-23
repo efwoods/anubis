@@ -1427,6 +1427,30 @@ async def think(
                 ),
             ]
 
+    # Activity review: "what did I do today / this week". Personal avatar only,
+    # and attached whether or not a machine is online, because the screen
+    # timeline is read from this avatar's own checkpointed threads; the machine
+    # sources report themselves unavailable when nothing is connected.
+    if is_personal_avatar:
+        from src.anubis.utils.activity.tools import (
+            activity_review_enabled,
+            build_activity_tools,
+        )
+
+        if activity_review_enabled(deep_agent_run_context):
+            analysis_extra_tools = [
+                *(analysis_extra_tools or []),
+                *build_activity_tools(
+                    deep_agent_run_context,
+                    user_id=state["user_state"]["user_id"],
+                    assistant_id=state["assistant_state"]["assistant_id"],
+                    timezone_name=(config.get("configurable", {}) or {}).get(
+                        "user_timezone"
+                    ),
+                    connections=live_connections,
+                ),
+            ]
+
     # Browser capability gate: the process-wide environment switch
     # (BROWSER_TOOLS_ENABLED) AND the personal avatar. The browser follows
     # links out of the owner's own mail and will carry the owner's signed-in
@@ -1873,6 +1897,24 @@ async def think(
     from src.anubis.utils.learning.fact_learned import TurnLearnedFactsCollector
 
     TurnLearnedFactsCollector.begin_turn()
+    # A name the user stated in the latest message was stored while the system
+    # prompt was built; the name belongs on this reply's learned facts.
+    name_facts_learned_in_turn = state.get("name_facts_learned_in_turn") or {}
+    latest_human_message_id = next(
+        (
+            getattr(message, "id", None)
+            for message in reversed(list(state.get("messages") or []))
+            if isinstance(message, HumanMessage)
+        ),
+        None,
+    )
+    if (
+        latest_human_message_id
+        and name_facts_learned_in_turn.get("message_id") == latest_human_message_id
+    ):
+        from src.anubis.utils.learning.fact_learned import seed_turn_learned_facts
+
+        seed_turn_learned_facts(name_facts_learned_in_turn.get("facts"))
     try:
         return await _run_avatar_deep_agent_turn(
             state,

@@ -28,10 +28,20 @@ class _FakeVerdict:
         proposed_fact_kind: str,
         user_message_role: str,
         supporting_quote_from_user_message: str,
+        proposed_fact_preserves_meaning: bool = True,
+        meaning_difference: str = "",
+        sentence_of_user_message_stating_the_action: str = "",
+        details_missing_from_that_sentence: list | None = None,
     ):
         self.proposed_fact_kind = proposed_fact_kind
         self.user_message_role = user_message_role
         self.supporting_quote_from_user_message = supporting_quote_from_user_message
+        self.proposed_fact_preserves_meaning = proposed_fact_preserves_meaning
+        self.meaning_difference = meaning_difference
+        self.sentence_of_user_message_stating_the_action = (
+            sentence_of_user_message_stating_the_action
+        )
+        self.details_missing_from_that_sentence = details_missing_from_that_sentence or []
         self.reason = "stub"
 
 
@@ -52,13 +62,23 @@ def _stub_model(
     proposed_fact_kind: str = "identity_fact",
     user_message_role: str = "states_the_information",
     supporting_quote_from_user_message: str = "",
+    proposed_fact_preserves_meaning: bool = True,
+    meaning_difference: str = "",
+    sentence_of_user_message_stating_the_action: str = "",
+    details_missing_from_that_sentence: list | None = None,
 ) -> _FakeModel:
     """Stub the verifier. The quote defaults to "" — tests that expect a fact to be ACCEPTED
     must pass a quote that really is part of the user message they hand in, because the caller
     verifies it."""
     model = _FakeModel(
         _FakeVerdict(
-            proposed_fact_kind, user_message_role, supporting_quote_from_user_message
+            proposed_fact_kind,
+            user_message_role,
+            supporting_quote_from_user_message,
+            proposed_fact_preserves_meaning,
+            meaning_difference,
+            sentence_of_user_message_stating_the_action,
+            details_missing_from_that_sentence,
         )
     )
     monkeypatch.setattr(identity_tools, "init_model", lambda **kwargs: model)
@@ -378,12 +398,12 @@ async def test_create_refuses_media_identity_fact_already_in_state(monkeypatch):
     )
 
     async def _fake_grounds_fact(*args, **kwargs):
-        return True
+        return identity_tools.FactGroundingVerdict(user_message_states_fact=True)
 
     async def _fake_extract(config):
         return {"user_id": "creator-1"}, {"assistant_id": "asst-1"}
 
-    monkeypatch.setattr(identity_tools, "_user_message_grounds_fact", _fake_grounds_fact)
+    monkeypatch.setattr(identity_tools, "_judge_fact_against_user_message", _fake_grounds_fact)
     monkeypatch.setattr(identity_tools, "extract_user_id_assistant_id", _fake_extract)
 
     class _Runtime:
@@ -424,12 +444,12 @@ async def test_create_always_runs_grounding_even_when_message_embeds_similarly(
 
     async def _fake_grounds_fact(fact, user_message_text, **kwargs):
         grounding_calls.append((fact, user_message_text))
-        return False
+        return identity_tools.FactGroundingVerdict(user_message_states_fact=False)
 
     async def _fake_extract(config):
         return {"user_id": "creator-1"}, {"assistant_id": "asst-1"}
 
-    monkeypatch.setattr(identity_tools, "_user_message_grounds_fact", _fake_grounds_fact)
+    monkeypatch.setattr(identity_tools, "_judge_fact_against_user_message", _fake_grounds_fact)
     monkeypatch.setattr(identity_tools, "extract_user_id_assistant_id", _fake_extract)
 
     class _Runtime:
@@ -460,3 +480,163 @@ async def test_create_always_runs_grounding_even_when_message_embeds_similarly(
     ]
     assert "Not learned:" in command.update["messages"][0].content
     assert "Learned:" not in command.update["messages"][0].content
+
+
+# ---- Meaning check: the rewrite must say only what the user's message says ------------------
+
+DIRT_MESSAGE = (
+    "There was this one time we went to get dirt at the old house. You asked me to come "
+    "with you. We went to the forest that was next to the house."
+)
+
+
+@pytest.mark.asyncio
+async def test_grounds_fact_rejects_a_fact_that_moves_a_place_onto_another_action(
+    monkeypatch,
+):
+    """The fact is sourced from the message, yet says the invitation pointed at the old
+    house, which the message never says (avatar 681fe8da, 2026-11-18)."""
+    _stub_model(
+        monkeypatch,
+        supporting_quote_from_user_message="You asked me to come with you",
+        proposed_fact_preserves_meaning=False,
+        meaning_difference="The message never says where the assistant asked the user to come.",
+    )
+    proposed_fact = "I asked the user to come with me to the old house."
+    assert await _user_message_grounds_fact(proposed_fact, DIRT_MESSAGE) is False
+
+    fact_grounding_verdict = await identity_tools._judge_fact_against_user_message(
+        proposed_fact, DIRT_MESSAGE
+    )
+    assert fact_grounding_verdict.user_message_states_fact is True
+    assert fact_grounding_verdict.fact_preserves_meaning is False
+    assert fact_grounding_verdict.is_accepted is False
+    assert "never says where" in fact_grounding_verdict.meaning_difference
+
+
+@pytest.mark.asyncio
+async def test_grounds_fact_accepts_a_fact_that_keeps_the_meaning(monkeypatch):
+    _stub_model(
+        monkeypatch,
+        supporting_quote_from_user_message="You asked me to come with you",
+    )
+    fact_grounding_verdict = await identity_tools._judge_fact_against_user_message(
+        "I asked the user to come with me.", DIRT_MESSAGE
+    )
+    assert fact_grounding_verdict.is_accepted is True
+
+
+def test_grounding_prompt_names_both_changes_of_meaning():
+    prompt = identity_tools._FACT_GROUNDING_SYSTEM_PROMPT
+    assert "THE MEANING MUST MATCH THE MESSAGE" in prompt
+    assert "A DETAIL MOVED BETWEEN SENTENCES" in prompt
+    assert "A SHARED ACTION TURNED INTO A CAUSED ACTION" in prompt
+
+
+@pytest.mark.asyncio
+async def test_create_refuses_a_fact_that_changes_the_meaning_and_names_the_change(
+    monkeypatch,
+):
+    from langgraph.store.memory import InMemoryStore
+
+    from src.anubis.utils.tools.identity.identity_tools import (
+        update_self_identity_mem_from_user_txt,
+    )
+
+    async def _fake_judge(*args, **kwargs):
+        return identity_tools.FactGroundingVerdict(
+            user_message_states_fact=True,
+            fact_preserves_meaning=False,
+            meaning_difference="The message never says where the assistant asked the user to come.",
+        )
+
+    async def _fake_extract(config):
+        return {"user_id": "creator-1"}, {"assistant_id": "asst-1"}
+
+    monkeypatch.setattr(identity_tools, "_judge_fact_against_user_message", _fake_judge)
+    monkeypatch.setattr(identity_tools, "extract_user_id_assistant_id", _fake_extract)
+
+    store = InMemoryStore()
+
+    class _Runtime:
+        tool_call_id = "tc-meaning"
+        state = {
+            "messages": [HumanMessage(content=DIRT_MESSAGE)],
+            "assistant_identity_documents": [],
+        }
+        config = {
+            "configurable": {
+                "user_id": "creator-1",
+                "assistant_id": "asst-1",
+                "assistant_ctx": {"metadata": {"user_id": "creator-1"}},
+            }
+        }
+
+    _Runtime.store = store
+    command = await update_self_identity_mem_from_user_txt.coroutine(
+        fact_shared_about_the_assistant_from_the_user=(
+            "I asked the user to come with me to the old house."
+        ),
+        runtime=_Runtime(),
+    )
+    content = command.update["messages"][0].content
+    assert content.startswith("Not learned:")
+    assert "changes the meaning of the user's most recent message" in content
+    assert "never says where" in content
+    assert await store.asearch(("creator-1", "asst-1", "identity_memory")) == []
+
+
+@pytest.mark.asyncio
+async def test_grounds_fact_hands_the_verifier_the_users_name(monkeypatch):
+    """Without the user's name the verifier read "Evan" as a person the fact added."""
+    model = _stub_model(
+        monkeypatch, supporting_quote_from_user_message="there was a snake next to me"
+    )
+    await identity_tools._judge_fact_against_user_message(
+        "There was a snake next to Evan.",
+        "You said watch out! there was a snake next to me.",
+        user_name="Evan",
+    )
+    human_prompt = model.calls[0][1].content
+    assert "USER_NAME: Evan" in human_prompt
+    assert "HOW PROPOSED_FACT REFERS TO THE USER" in identity_tools._FACT_GROUNDING_SYSTEM_PROMPT
+
+
+def test_user_name_from_runtime_reads_state_then_configurable():
+    class _RuntimeWithState:
+        state = {"user_state": {"user_name": "Evan"}}
+        config = {"configurable": {"user_ctx": {"name": "Other"}}}
+
+    class _RuntimeWithConfigOnly:
+        state = {}
+        config = {"configurable": {"user_ctx": {"name": "Evan"}}}
+
+    class _RuntimeWithNothing:
+        state = {}
+        config = {}
+
+    assert identity_tools._user_name_from_runtime(_RuntimeWithState()) == "Evan"
+    assert identity_tools._user_name_from_runtime(_RuntimeWithConfigOnly()) == "Evan"
+    assert identity_tools._user_name_from_runtime(_RuntimeWithNothing()) == ""
+
+
+@pytest.mark.asyncio
+async def test_a_listed_missing_detail_refuses_the_fact_even_when_the_flag_says_preserved(
+    monkeypatch,
+):
+    """The small verifier model lists the moved detail more reliably than the model sets
+    the yes-or-no flag, so a non-empty list alone refuses the fact."""
+    _stub_model(
+        monkeypatch,
+        supporting_quote_from_user_message="You asked me to come with you",
+        proposed_fact_preserves_meaning=True,
+        sentence_of_user_message_stating_the_action="You asked me to come with you.",
+        details_missing_from_that_sentence=["to the old house"],
+    )
+    fact_grounding_verdict = await identity_tools._judge_fact_against_user_message(
+        "I asked the user to come with me to the old house.", DIRT_MESSAGE
+    )
+    assert fact_grounding_verdict.user_message_states_fact is True
+    assert fact_grounding_verdict.fact_preserves_meaning is False
+    assert "to the old house" in fact_grounding_verdict.meaning_difference
+    assert "You asked me to come with you." in fact_grounding_verdict.meaning_difference

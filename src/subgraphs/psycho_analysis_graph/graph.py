@@ -140,8 +140,11 @@ async def psycho_analysis(
     from src.anubis.utils.moderation.content_moderation import moderation_flag_enabled
 
     context = getattr(runtime, "context", None) or GlobalContext()
+    # The psycho-analysis branch is inert unless ENABLE_PSYCHOLOGICAL_ANALYSIS is
+    # explicitly TRUE: a missing or empty flag must never start the per-document,
+    # per-dimension model calls.
     if not moderation_flag_enabled(
-        getattr(context, "enable_psychological_analysis", "TRUE")
+        getattr(context, "enable_psychological_analysis", "FALSE"), default=False
     ):
         logger.info(
             "psycho analysis: disabled via ENABLE_PSYCHOLOGICAL_ANALYSIS; skipping"

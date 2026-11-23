@@ -3300,6 +3300,11 @@ async def lifespan(app: FastAPI):
         app.state.graph = message_workflow.compile(
             store=store, checkpointer=checkpointer
         )
+        # The activity review reads the owner's screen observations out of
+        # the checkpointed threads through this compiled graph.
+        from src.anubis.utils.activity.thread_reader import register_activity_graph
+
+        register_activity_graph(app.state.graph)
         # Scheduled reports (weekly sprint digest, monthly spend digest, and
         # any report the owner schedules in conversation) run through the
         # graph on a fresh hidden thread and land in the inbox as notify items.

@@ -1,4 +1,3 @@
-src/anubis/utils/activity/
 keys/
 adapters
 # The adapter-service client is source, not a trained adapter: keep it tracked.
